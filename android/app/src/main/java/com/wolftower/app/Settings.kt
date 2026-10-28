@@ -65,4 +65,22 @@ object Settings {
     fun notifAsked(ctx: Context): Boolean = prefs(ctx).getBoolean("notif_asked", false)
 
     fun setNotifAsked(ctx: Context) = prefs(ctx).edit().putBoolean("notif_asked", true).apply()
+
+    /** Идентификаторы способов обхода на базе sing-box. */
+    const val ENGINE_SB_FRAGMENT = "sb_fragment"
+    const val ENGINE_SB_WARP = "sb_warp"
+
+    /** DNS для sing-box: "cloudflare" (по умолчанию), "google" или "system". */
+    fun sbDns(ctx: Context): String = prefs(ctx).getString("sb_dns", "cloudflare") ?: "cloudflare"
+
+    fun setSbDns(ctx: Context, value: String) {
+        prefs(ctx).edit().putString("sb_dns", value).apply()
+    }
+
+    /** Сохранённый аккаунт WARP в виде JSON (см. WarpAccount.toJson) или null, пока он не создан. */
+    fun warpAccount(ctx: Context): String? = prefs(ctx).getString("warp_account", null)
+
+    fun setWarpAccount(ctx: Context, json: String) {
+        prefs(ctx).edit().putString("warp_account", json).apply()
+    }
 }
