@@ -1,4 +1,5 @@
 const { probeHost } = require('./probe');
+const { DohSocks } = require('./dohsocks');
 
 async function runWithLimit(tasks, limit) {
   let i = 0;
@@ -14,8 +15,11 @@ async function runWithLimit(tasks, limit) {
 /**
  * Для каждого варианта стратегии поднимается отдельный ByeDPI (по 4 одновременно) и через него
  * проверяются тестовые адреса выбранных сервисов. Возвращает { idСервиса: { стратегия: числоУспехов } }.
+ * Проверка идёт через тот же DNS-переходник, что и рабочий режим: иначе системный DNS отдаёт закрытые провайдером
+ * адреса (так у Instagram), и ни одна стратегия не проходит, хотя в рабочем режиме страница бы открылась.
  */
-async function score({ makeProcess, freePort, forName, profiles, candidates, isCancelled, onProgress, batch = 4 }) {
+async function score({ makeProcess, freePort, forName, profiles, candidates, isCancelled, onProgress, batch = 4, makeFront }) {
+  const newFront = makeFront || ((upstreamPort) => new DohSocks({ upstreamPort, staggerMs: 1000 }));
   const counts = {};
   for (const p of profiles) counts[p.id] = {};
 
@@ -28,8 +32,11 @@ async function score({ makeProcess, freePort, forName, profiles, candidates, isC
       for (const strategy of group) {
         const port = await freePort();
         const proc = makeProcess();
-        if (await proc.start(port, forName(strategy))) procs.push({ strategy, port, proc });
-        else reason = proc.lastError || reason;
+        if (await proc.start(port, forName(strategy))) {
+          const front = newFront(port);
+          await front.start();
+          procs.push({ strategy, port: front.port, proc, front });
+        } else reason = proc.lastError || reason;
       }
       if (!procs.length) throw new Error('не удалось запустить ByeDPI' + (reason ? ': ' + reason : ''));
       const tasks = [];
@@ -46,7 +53,7 @@ async function score({ makeProcess, freePort, forName, profiles, candidates, isC
       }
       await runWithLimit(tasks, 12);
     } finally {
-      await Promise.all(procs.map((p) => p.proc.stop()));
+      await Promise.all(procs.map((p) => Promise.all([p.front.stop().catch(() => {}), p.proc.stop()])));
     }
     onProgress(Math.min(i + batch, candidates.length));
     // Ранее найденный вариант с полным баллом не проиграет более позднему (при равенстве выигрывает более
