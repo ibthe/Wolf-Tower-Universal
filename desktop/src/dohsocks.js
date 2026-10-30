@@ -64,16 +64,38 @@ function dohQuery(ep, name, timeoutMs) {
   });
 }
 
-/** Первый успешный ответ из всех DoH-серверов (параллельно). */
-function dohResolve(name, timeoutMs = 3000) {
+/**
+ * Адреса от всех DoH-серверов сразу (параллельно). Возвращаем, как только пришёл первый ответ, плюс короткая пауза
+ * на остальные: разные серверы отдают разные адреса, а часть адресов провайдер может блокировать по IP
+ * (например, у Instagram один адрес закрыт, а другой открывается).
+ */
+function dohResolve(name, timeoutMs = 3000, graceMs = 250) {
   return new Promise((resolve, reject) => {
     let left = DOH_ENDPOINTS.length;
     let lastErr;
+    const ips = [];
+    let ttl = Infinity;
+    let timer = null;
+    let done = false;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      resolve({ ips: [...new Set(ips)], ttl: Number.isFinite(ttl) ? ttl : 0 });
+    };
     for (const ep of DOH_ENDPOINTS) {
-      dohQuery(ep, name, timeoutMs).then(resolve, (e) => {
-        lastErr = e;
-        if (--left === 0) reject(lastErr);
-      });
+      dohQuery(ep, name, timeoutMs).then(
+        (r) => {
+          ips.push(...r.ips);
+          ttl = Math.min(ttl, r.ttl);
+          if (!timer) timer = setTimeout(finish, graceMs);
+          if (--left === 0) finish();
+        },
+        (e) => {
+          lastErr = e;
+          if (--left === 0) (ips.length ? finish() : reject(lastErr));
+        }
+      );
     }
   });
 }
@@ -126,9 +148,11 @@ function readExact(sock, n) {
 }
 
 /** Подключается к ByeDPI по SOCKS5 и просит соединение с IPv4:портом. Возвращает сокет и ответ ByeDPI. */
-async function connectViaUpstream(upstreamPort, ip, port) {
+async function connectViaUpstream(upstreamPort, ip, port, timeoutMs = 8000, track = () => {}) {
   const up = net.connect({ host: '127.0.0.1', port: upstreamPort });
-  up.setTimeout(15000, () => up.destroy(new Error('таймаут подключения')));
+  track(up);
+  up.on('error', () => {});
+  up.setTimeout(timeoutMs, () => up.destroy(new Error('таймаут подключения')));
   await new Promise((res, rej) => {
     up.once('connect', res);
     up.once('error', rej);
@@ -148,16 +172,124 @@ async function connectViaUpstream(upstreamPort, ip, port) {
   return { up, rep: head[1], reply: Buffer.concat([head, tail]) };
 }
 
+/**
+ * Серверы Meta принимают любое своё имя на любом своём адресе, а провайдер блокирует адреса по отдельности:
+ * www.instagram.com может получить закрытый адрес, а i.instagram.com открытый. Для таких доменов добавляем в список
+ * адреса соседних хостов и запоминаем адрес, на котором соединение прошло.
+ */
+const FAMILIES = [
+  {
+    key: 'meta',
+    suffixes: ['instagram.com', 'cdninstagram.com', 'instagr.am', 'ig.me', 'facebook.com', 'facebook.net', 'fb.com', 'fbcdn.net', 'fbsbx.com'],
+    siblings: ['i.instagram.com', 'graph.instagram.com', 'graph.facebook.com', 'static.xx.fbcdn.net'],
+  },
+];
+
+function familyOf(host) {
+  const h = host.toLowerCase();
+  return FAMILIES.find((f) => f.suffixes.some((x) => h === x || h.endsWith('.' + x))) || null;
+}
+
+const BAD_MS = 10 * 60 * 1000;
+const badUntil = new Map(); // ip -> время, до которого адрес считаем закрытым
+const familyGood = new Map(); // семейство -> адрес, на котором соединение прошло
+
+const markBad = (ip) => badUntil.set(ip, Date.now() + BAD_MS);
+const markGood = (ip) => badUntil.delete(ip);
+const isBad = (ip) => (badUntil.get(ip) || 0) > Date.now();
+const byHealth = (ips) => [...ips.filter((i) => !isBad(i)), ...ips.filter(isBad)];
+
+/** Список адресов для попыток: свои, затем рабочий адрес семейства, затем адреса соседних хостов. */
+async function candidateIps(host, doh) {
+  const fam = familyOf(host);
+  let own = [];
+  try {
+    own = byHealth(await resolve4(host, doh));
+  } catch (e) {
+    if (!fam) throw e;
+  }
+  const out = [...own.slice(0, 2)];
+  if (fam) {
+    const good = familyGood.get(fam.key);
+    if (good) out.push(good);
+    const sib = await Promise.allSettled(fam.siblings.map((h) => resolve4(h, doh)));
+    const extra = byHealth(sib.flatMap((r) => (r.status === 'fulfilled' ? r.value : [])));
+    out.push(...extra.slice(0, 3), ...own.slice(2, 3));
+  } else {
+    out.push(...own.slice(2, 4));
+  }
+  const list = [...new Set(out)];
+  if (!list.length) throw new Error('нет адресов');
+  return list.slice(0, 6);
+}
+
+/**
+ * Пробует адреса по очереди со сдвигом: следующий запускается, если предыдущий не ответил за staggerMs или сразу
+ * отказал. Побеждает первый, у кого соединение прошло; остальные закрываются.
+ */
+function raceConnect(upstreamPort, ips, port, { staggerMs = 1500, timeoutMs = 8000, track = () => {} } = {}) {
+  return new Promise((resolve, reject) => {
+    let started = 0;
+    let finished = 0;
+    let done = false;
+    let timer = null;
+    let lastErr = new Error('нет адресов');
+    const socks = new Set();
+    const pending = new Set();
+    const trackAll = (sock) => {
+      socks.add(sock);
+      track(sock);
+    };
+    const next = () => {
+      clearTimeout(timer);
+      if (done || started >= ips.length) return;
+      const ip = ips[started++];
+      pending.add(ip);
+      if (started < ips.length) timer = setTimeout(next, staggerMs);
+      const fail = (e) => {
+        pending.delete(ip);
+        lastErr = e;
+        finished++;
+        if (done) return;
+        if (started < ips.length) next();
+        else if (finished >= ips.length) {
+          done = true;
+          reject(lastErr);
+        }
+      };
+      connectViaUpstream(upstreamPort, ip, port, timeoutMs, trackAll).then(
+        (r) => {
+          if (done) return void r.up.destroy();
+          if (r.rep !== 0) {
+            r.up.destroy();
+            return fail(new Error('код ответа ' + r.rep));
+          }
+          done = true;
+          clearTimeout(timer);
+          pending.delete(ip);
+          for (const other of pending) markBad(other); // не успели ответить, пока другой адрес уже открылся
+          for (const s of socks) if (s !== r.up) s.destroy();
+          markGood(ip);
+          resolve({ ...r, ip });
+        },
+        fail
+      );
+    };
+    next();
+  });
+}
+
 const FAIL = (code) => Buffer.from([5, code, 0, 1, 0, 0, 0, 0, 0, 0]);
 
 class DohSocks {
   /**
    * @param {{upstreamPort: number, log?: Function, doh?: Function}} o
    */
-  constructor({ upstreamPort, log = () => {}, doh = dohResolve }) {
+  constructor({ upstreamPort, log = () => {}, doh = dohResolve, staggerMs = 1500 }) {
     this.upstreamPort = upstreamPort;
     this.log = log;
     this.doh = doh;
+    this.staggerMs = staggerMs;
     this.server = null;
     this.port = 0;
     this.sockets = new Set();
@@ -217,42 +349,38 @@ class DohSocks {
 
     let ips;
     try {
-      ips = await resolve4(host, this.doh);
+      ips = await candidateIps(host, this.doh);
     } catch (e) {
       this.noteFail(host, e.message);
       client.write(FAIL(4)); // хост недостижим
       return client.end();
     }
 
-    let last = null;
-    for (const ip of ips.slice(0, 3)) {
-      let r;
-      try {
-        r = await connectViaUpstream(this.upstreamPort, ip, port);
-      } catch (e) {
-        last = e;
-        continue;
-      }
-      if (r.rep !== 0) {
-        r.up.destroy();
-        last = new Error('код ответа ' + r.rep);
-        continue;
-      }
-      this.sockets.add(r.up);
-      r.up.once('close', () => this.sockets.delete(r.up));
-      r.up.on('error', () => client.destroy());
-      client.on('close', () => r.up.destroy());
-      r.up.on('close', () => client.destroy());
-      client.setTimeout(0);
-      client.write(r.reply);
-      client.pipe(r.up);
-      r.up.pipe(client);
-      return;
+    let r;
+    try {
+      r = await raceConnect(this.upstreamPort, ips, port, {
+        staggerMs: this.staggerMs,
+        track: (sock) => {
+          this.sockets.add(sock);
+          sock.once('close', () => this.sockets.delete(sock));
+        },
+      });
+    } catch (e) {
+      this.noteFail(host, e.message);
+      client.write(FAIL(5)); // отказ в соединении
+      return client.end();
     }
-    this.noteFail(host, last ? last.message : 'нет адресов');
-    client.write(FAIL(5)); // отказ в соединении
-    client.end();
+    const fam = familyOf(host);
+    if (fam) familyGood.set(fam.key, r.ip);
+    if (client.destroyed) return r.up.destroy();
+    r.up.on('error', () => client.destroy());
+    client.on('close', () => r.up.destroy());
+    r.up.on('close', () => client.destroy());
+    client.setTimeout(0);
+    client.write(r.reply);
+    client.pipe(r.up);
+    r.up.pipe(client);
   }
 }
 
-module.exports = { DohSocks, resolve4, parseDohAnswer, dohResolve };
+module.exports = { DohSocks, resolve4, parseDohAnswer, dohResolve, raceConnect, candidateIps };

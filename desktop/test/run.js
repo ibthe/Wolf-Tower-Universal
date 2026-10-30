@@ -485,6 +485,85 @@ const config = loadConfig([path.join(root, 'profiles', 'profiles.json')]);
     assert.strictEqual(seenAtyp, 1, 'в ByeDPI должен прийти IPv4-адрес, а не имя');
   });
 
+  // поддельный ByeDPI: на "закрытые" адреса не отвечает вообще (как блокировка по IP), на остальные отвечает эхом
+  const fakeSocksUpstream = async (blockedIps, seen) => {
+    const srv = net.createServer((s) => {
+      s.on('error', () => {});
+      s.once('data', () => {
+        s.write(Buffer.from([5, 0]));
+        s.once('data', (d) => {
+          const ip = [...d.subarray(4, 8)].join('.');
+          seen.push(ip);
+          if (blockedIps.includes(ip)) return; // молчим: соединение "висит"
+          s.write(Buffer.from([5, 0, 0, 1, 0, 0, 0, 0, 0, 0]));
+          s.on('data', (x) => s.write(Buffer.concat([Buffer.from('ok:'), x])));
+        });
+      });
+    });
+    await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+    return srv;
+  };
+  const viaFront = (front, host) =>
+    new Promise((resolve, reject) => {
+      const c = net.connect(front.port, '127.0.0.1');
+      let st = 0;
+      c.on('connect', () => c.write(Buffer.from([5, 1, 0])));
+      c.on('data', (d) => {
+        if (st === 0) {
+          st = 1;
+          const h = Buffer.from(host);
+          c.write(Buffer.concat([Buffer.from([5, 1, 0, 3, h.length]), h, Buffer.from([1, 187])]));
+        } else if (st === 1) {
+          st = 2;
+          if (d[1] !== 0) return resolve('fail:' + d[1]), c.destroy();
+          c.write('hi');
+        } else {
+          resolve(d.toString());
+          c.destroy();
+        }
+      });
+      c.on('error', reject);
+      setTimeout(() => reject(new Error('таймаут теста')), 6000);
+    });
+
+  await test('DNS-переходник: закрытый провайдером адрес пропускается, берётся рабочий', async () => {
+    const seen = [];
+    const fake = await fakeSocksUpstream(['203.0.113.7'], seen);
+    const front = new DohSocks({
+      upstreamPort: fake.address().port,
+      staggerMs: 100,
+      doh: async () => ({ ips: ['203.0.113.7', '127.0.0.1'], ttl: 60 }),
+    });
+    await front.start();
+    const t0 = Date.now();
+    const answer = await viaFront(front, 'blocked-first.example');
+    await front.stop();
+    fake.close();
+    assert.strictEqual(answer, 'ok:hi');
+    assert.ok(Date.now() - t0 < 3000);
+    assert.deepStrictEqual(seen.slice(0, 2), ['203.0.113.7', '127.0.0.1']);
+  });
+
+  await test('DNS-переходник: если адреса www закрыты, берутся адреса соседнего хоста Instagram', async () => {
+    const seen = [];
+    const fake = await fakeSocksUpstream(['203.0.113.8'], seen);
+    const front = new DohSocks({
+      upstreamPort: fake.address().port,
+      staggerMs: 100,
+      doh: async (name) => {
+        if (name === 'www.instagram.com') return { ips: ['203.0.113.8'], ttl: 60 };
+        if (name === 'i.instagram.com') return { ips: ['127.0.0.1'], ttl: 60 };
+        throw new Error('нет');
+      },
+    });
+    await front.start();
+    const answer = await viaFront(front, 'www.instagram.com');
+    await front.stop();
+    fake.close();
+    assert.strictEqual(answer, 'ok:hi');
+    assert.ok(seen.includes('127.0.0.1'));
+  });
+
   console.log(results.join('\n'));
   console.log(`\nПройдено проверок: ${passed}${process.exitCode ? ', ЕСТЬ ОШИБКИ' : ''}`);
   fs.rmSync(tmp, { recursive: true, force: true });
