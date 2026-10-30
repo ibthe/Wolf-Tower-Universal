@@ -5,6 +5,7 @@ const net = require('net');
 const path = require('path');
 const { buildGroups, enabledIds, supported, BASE } = require('./profiles');
 const { PacServer } = require('./pac');
+const { DohSocks } = require('./dohsocks');
 const sysproxy = require('./sysproxy');
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -178,6 +179,7 @@ class Engine extends EventEmitter {
     this.config = config;
     this.pac = new PacServer();
     this.bye = null;
+    this.front = null; // SOCKS5-переходник с DNS-over-HTTPS перед ByeDPI
     this.running = false;
     this.socksPort = 0;
   }
@@ -227,11 +229,25 @@ class Engine extends EventEmitter {
     bye.on('log', (l) => this.log('byedpi: ' + l));
     if (!(await bye.start(port, [...BASE, ...args]))) return false;
     this.bye = bye;
-    this.socksPort = port;
+
+    // Браузер ходит не прямо в ByeDPI, а через переходник: он сам определяет адрес домена через DNS-over-HTTPS.
+    // Системный DNS провайдера часто режет или подменяет адреса (в журнале: "byedpi: not resolved: ..."), а ByeDPI
+    // использует именно его.
+    const front = new DohSocks({ upstreamPort: port, log: (m) => this.log(m) });
+    try {
+      await front.start();
+    } catch (e) {
+      this.log('Не удалось запустить DNS-переходник: ' + e.message);
+      await bye.stop();
+      this.bye = null;
+      return false;
+    }
+    this.front = front;
+    this.socksPort = front.port;
 
     try {
       await this.pac.start();
-      this.pac.update(sel.flatMap((s) => s.profile.domains), port);
+      this.pac.update(sel.flatMap((s) => s.profile.domains), front.port);
       // Ставим PAC не по флагу, а по факту: порт PAC-сервера меняется при каждом запуске программы, а настройки
       // системы могли остаться от прошлого сеанса или быть не применены (отменён запрос пароля).
       let state = await sysproxy.check(this.pac.url);
@@ -244,6 +260,7 @@ class Engine extends EventEmitter {
     } catch (e) {
       this.log('Не удалось настроить системный прокси: ' + e.message);
       this.pac.update([], 0);
+      await this.stopFront();
       await bye.stop();
       this.bye = null;
       return false;
@@ -254,14 +271,21 @@ class Engine extends EventEmitter {
         this.log('ByeDPI остановился неожиданно, защита выключена');
         this.running = false;
         this.pac.update([], 0);
+        this.stopFront();
         this.bye = null;
         this.emit('changed');
       }
     });
     this.running = true;
-    this.log(`Защита включена. SOCKS5 127.0.0.1:${port}`);
+    this.log(`Защита включена. SOCKS5 127.0.0.1:${front.port} (DNS через DoH) -> ByeDPI :${port}`);
     this.emit('changed');
     return true;
+  }
+
+  async stopFront() {
+    const f = this.front;
+    this.front = null;
+    if (f) await f.stop().catch(() => {});
   }
 
   /** Выключает защиту. Системная настройка PAC остаётся, но отдаёт "напрямую" для всех адресов. */
@@ -269,6 +293,7 @@ class Engine extends EventEmitter {
     const wasRunning = this.running || this.bye;
     this.running = false;
     this.pac.update([], 0);
+    await this.stopFront();
     if (this.bye) {
       const b = this.bye;
       this.bye = null;

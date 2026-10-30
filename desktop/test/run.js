@@ -16,6 +16,7 @@ const { License } = require('../src/license');
 const { probeHost } = require('../src/probe');
 const { chooseBest } = require('../src/autoprobe');
 const { Engine, ByeDpi, freePort } = require('../src/engine');
+const { DohSocks, parseDohAnswer, resolve4 } = require('../src/dohsocks');
 
 let passed = 0;
 const results = [];
@@ -426,6 +427,63 @@ const config = loadConfig([path.join(root, 'profiles', 'profiles.json')]);
   } else {
     results.push('SKIP движок с реальным ByeDPI (задайте WT_TEST_CIADPI=путь к ciadpi)');
   }
+
+  await test('DNS-переходник: разбор ответа DoH и кэш', async () => {
+    assert.deepStrictEqual(
+      parseDohAnswer({ Status: 0, Answer: [{ type: 5, data: 'x.' }, { type: 1, TTL: 120, data: '1.2.3.4' }, { type: 1, TTL: 30, data: '5.6.7.8' }] }),
+      { ips: ['1.2.3.4', '5.6.7.8'], ttl: 30 }
+    );
+    assert.deepStrictEqual(parseDohAnswer({ Status: 3 }), { ips: [], ttl: 0 });
+    let calls = 0;
+    const doh = async () => (calls++, { ips: ['9.9.9.9'], ttl: 60 });
+    assert.deepStrictEqual(await resolve4('cache-test.example', doh), ['9.9.9.9']);
+    assert.deepStrictEqual(await resolve4('cache-test.example', doh), ['9.9.9.9']);
+    assert.strictEqual(calls, 1);
+    assert.deepStrictEqual(await resolve4('127.0.0.1', doh), ['127.0.0.1']);
+  });
+
+  await test('DNS-переходник: домен определяется сам и уходит в ByeDPI уже адресом', async () => {
+    // поддельный "ByeDPI": принимает SOCKS5 и запоминает, какой тип адреса ему прислали
+    let seenAtyp = null;
+    const fake = net.createServer((s) => {
+      s.once('data', () => {
+        s.write(Buffer.from([5, 0]));
+        s.once('data', (d) => {
+          seenAtyp = d[3];
+          s.write(Buffer.from([5, 0, 0, 1, 0, 0, 0, 0, 0, 0]));
+          s.on('data', (x) => s.write(Buffer.concat([Buffer.from('ok:'), x])));
+        });
+      });
+    });
+    await new Promise((r) => fake.listen(0, '127.0.0.1', r));
+    const front = new DohSocks({ upstreamPort: fake.address().port, doh: async () => ({ ips: ['127.0.0.1'], ttl: 60 }) });
+    await front.start();
+    const answer = await new Promise((resolve, reject) => {
+      const c = net.connect(front.port, '127.0.0.1');
+      let st = 0;
+      c.on('connect', () => c.write(Buffer.from([5, 1, 0])));
+      c.on('data', (d) => {
+        if (st === 0) {
+          st = 1;
+          const h = Buffer.from('studio.youtube.com');
+          c.write(Buffer.concat([Buffer.from([5, 1, 0, 3, h.length]), h, Buffer.from([1, 187])]));
+        } else if (st === 1) {
+          st = 2;
+          assert.strictEqual(d[1], 0);
+          c.write('hi');
+        } else {
+          resolve(d.toString());
+          c.destroy();
+        }
+      });
+      c.on('error', reject);
+      setTimeout(() => reject(new Error('таймаут')), 4000);
+    });
+    await front.stop();
+    fake.close();
+    assert.strictEqual(answer, 'ok:hi');
+    assert.strictEqual(seenAtyp, 1, 'в ByeDPI должен прийти IPv4-адрес, а не имя');
+  });
 
   console.log(results.join('\n'));
   console.log(`\nПройдено проверок: ${passed}${process.exitCode ? ', ЕСТЬ ОШИБКИ' : ''}`);
