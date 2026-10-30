@@ -312,6 +312,24 @@ class DohSocks {
     this.server = null;
   }
 
+  /**
+   * Итог одного соединения для диагностики: "без ответа" (отправили запрос, а в ответ ни байта: обрыв, сброс или
+   * блокировка) и "работает". Сообщения по одному хосту не чаще раза в 20 секунд, чтобы не засорять журнал.
+   */
+  noteDone(host, ip, sent, got, ms) {
+    if (!sent && !got) return;
+    const bad = got === 0;
+    const key = host + (bad ? '!' : '+');
+    const last = this.failed.get(key) || 0;
+    if (Date.now() - last < 20000) return;
+    this.failed.set(key, Date.now());
+    this.log(
+      bad
+        ? `Соединение без ответа: ${host} (${ip}), отправлено ${sent} Б, получено 0 Б, ${ms} мс`
+        : `Соединение работает: ${host} (${ip}), получено ${got} Б, ${ms} мс`
+    );
+  }
+
   noteFail(host, why) {
     const last = this.failed.get(host) || 0;
     if (Date.now() - last > 30000) {
@@ -377,6 +395,19 @@ class DohSocks {
     client.on('close', () => r.up.destroy());
     r.up.on('close', () => client.destroy());
     client.setTimeout(0);
+    const t0 = Date.now();
+    let sent = 0;
+    let got = 0;
+    let reported = false;
+    const report = () => {
+      if (reported) return;
+      reported = true;
+      this.noteDone(host, r.ip, sent, got, Date.now() - t0);
+    };
+    client.on('data', (d) => (sent += d.length));
+    r.up.on('data', (d) => (got += d.length));
+    client.once('close', report);
+    r.up.once('close', report);
     client.write(r.reply);
     client.pipe(r.up);
     r.up.pipe(client);
