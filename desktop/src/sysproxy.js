@@ -106,31 +106,64 @@ async function macAdmin(lines) {
 
 // ------------------------------------------------------------------ общий интерфейс
 
-/** Включает автоматическую настройку прокси (PAC) в системе. Прежние значения запоминаются для восстановления. */
+/**
+ * Включает автоматическую настройку прокси (PAC) в системе. Прежние значения запоминаются для восстановления.
+ * Флаг sysproxyInstalled ставится только ПОСЛЕ успешного применения: иначе отменённый запрос пароля на macOS
+ * оставлял флаг включённым, и следующий запуск защиты пропускал настройку (защита "включена", а PAC в системе нет).
+ * Если настройки уже были установлены нами, прежние значения не перезаписываются (иначе потеряется оригинал).
+ */
 async function install(pacUrl, store, log) {
+  const already = store.get('sysproxyInstalled', false);
   if (process.platform === 'win32') {
-    const prev = { AutoConfigURL: await winGet('AutoConfigURL') };
-    store.set('sysproxyPrev', prev);
-    store.set('sysproxyInstalled', true);
+    const prev = already ? store.get('sysproxyPrev', {}) : { AutoConfigURL: await winGet('AutoConfigURL') };
     await winSet('AutoConfigURL', pacUrl);
     await winRefresh();
+    store.set('sysproxyPrev', prev);
+    store.set('sysproxyInstalled', true);
+    store.set('sysproxyUrl', pacUrl);
     log('Системный прокси: включена автонастройка (PAC)');
   } else if (process.platform === 'darwin') {
     const services = await macServices();
-    const prev = {};
-    for (const s of services) prev[s] = await macGetAuto(s);
-    store.set('sysproxyPrev', prev);
-    store.set('sysproxyInstalled', true);
+    const prev = already ? { ...store.get('sysproxyPrev', {}) } : {};
+    for (const s of services) if (!(s in prev)) prev[s] = await macGetAuto(s);
     const lines = [];
     for (const s of services) {
       lines.push(`networksetup -setautoproxyurl ${sq(s)} ${sq(pacUrl)}`);
       lines.push(`networksetup -setautoproxystate ${sq(s)} on`);
     }
     await macAdmin(lines);
+    store.set('sysproxyPrev', prev);
+    store.set('sysproxyInstalled', true);
+    store.set('sysproxyUrl', pacUrl);
     log('Системный прокси: включена автонастройка (PAC) для ' + services.length + ' сетевых служб');
   } else {
     log('Системный прокси: на этой ОС не настраивается (только для разработки)');
   }
+}
+
+/**
+ * Проверяет, что в системе прямо сейчас стоит именно наш PAC (а не устаревший адрес прошлого запуска,
+ * не сброшенный пользователем и не чужой). Возвращает { ok, detail } для сообщения в журнал.
+ */
+async function check(pacUrl) {
+  try {
+    if (process.platform === 'win32') {
+      const cur = await winGet('AutoConfigURL');
+      return { ok: cur === pacUrl, detail: cur || 'не задан' };
+    }
+    if (process.platform === 'darwin') {
+      const services = await macServices();
+      const bad = [];
+      for (const s of services) {
+        const a = await macGetAuto(s);
+        if (!a.enabled || a.url !== pacUrl) bad.push(`${s}: ${a.enabled ? a.url || 'пусто' : 'выключен'}`);
+      }
+      return { ok: bad.length === 0, detail: bad.join('; ') };
+    }
+  } catch (e) {
+    return { ok: false, detail: e.message };
+  }
+  return { ok: true, detail: '' };
 }
 
 /** Возвращает прежние настройки прокси. */
@@ -150,6 +183,7 @@ async function restore(store, log) {
     if (lines.length) await macAdmin(lines);
   }
   store.set('sysproxyInstalled', false);
+  store.set('sysproxyUrl', '');
   log('Системный прокси: настройки возвращены');
 }
 
@@ -165,4 +199,4 @@ async function cleanupStale(store, log) {
   }
 }
 
-module.exports = { install, restore, cleanupStale, run, sq, parseRegValue, parseAutoProxy };
+module.exports = { install, check, restore, cleanupStale, run, sq, parseRegValue, parseAutoProxy };

@@ -232,9 +232,15 @@ class Engine extends EventEmitter {
     try {
       await this.pac.start();
       this.pac.update(sel.flatMap((s) => s.profile.domains), port);
-      if (!this.store.get('sysproxyInstalled', false)) {
+      // Ставим PAC не по флагу, а по факту: порт PAC-сервера меняется при каждом запуске программы, а настройки
+      // системы могли остаться от прошлого сеанса или быть не применены (отменён запрос пароля).
+      let state = await sysproxy.check(this.pac.url);
+      if (!state.ok) {
         await sysproxy.install(this.pac.url, this.store, (m) => this.log(m));
+        state = await sysproxy.check(this.pac.url);
       }
+      if (!state.ok) throw new Error('система не приняла настройку прокси (' + state.detail + ')');
+      this.log('Системный прокси: PAC ' + this.pac.url + ' активен');
     } catch (e) {
       this.log('Не удалось настроить системный прокси: ' + e.message);
       this.pac.update([], 0);
