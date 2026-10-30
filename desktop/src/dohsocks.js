@@ -285,8 +285,14 @@ class DohSocks {
   /**
    * @param {{upstreamPort: number, log?: Function, doh?: Function}} o
    */
-  constructor({ upstreamPort, log = () => {}, doh = dohResolve, staggerMs = 1500 }) {
+  /**
+   * @param {{upstreamPort: number, routes?: {name: string, domains: string[], port: number}[], log?: Function}} o
+   * routes: домены, которые идут не в основной ByeDPI, а в отдельный (для сервисов без SNI, например чат WhatsApp).
+   */
+  constructor({ upstreamPort, routes = [], log = () => {}, doh = dohResolve, staggerMs = 1500 }) {
     this.upstreamPort = upstreamPort;
+    this.routes = routes;
+    this.seen = new Set(); // хосты, о первом соединении с которыми уже записано в журнал
     this.log = log;
     this.doh = doh;
     this.staggerMs = staggerMs;
@@ -328,6 +334,12 @@ class DohSocks {
         ? `Соединение без ответа: ${host} (${ip}), отправлено ${sent} Б, получено 0 Б, ${ms} мс`
         : `Соединение работает: ${host} (${ip}), получено ${got} Б, ${ms} мс`
     );
+  }
+
+  /** Отдельный маршрут для домена (поддомены тоже) или null. */
+  routeFor(host) {
+    const h = host.toLowerCase();
+    return this.routes.find((r) => r.domains.some((d) => h === d || h.endsWith('.' + d))) || null;
   }
 
   noteFail(host, why) {
@@ -374,9 +386,14 @@ class DohSocks {
       return client.end();
     }
 
+    const route = this.routeFor(host);
+    if (!this.seen.has(host) && this.seen.size < 150) {
+      this.seen.add(host);
+      this.log(`Запрос: ${host}:${port} [${ips.join(', ')}]${route ? ' -> отдельный ByeDPI ' + route.name : ''}`);
+    }
     let r;
     try {
-      r = await raceConnect(this.upstreamPort, ips, port, {
+      r = await raceConnect(route ? route.port : this.upstreamPort, ips, port, {
         staggerMs: this.staggerMs,
         track: (sock) => {
           this.sockets.add(sock);

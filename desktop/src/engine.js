@@ -3,7 +3,7 @@ const EventEmitter = require('events');
 const fs = require('fs');
 const net = require('net');
 const path = require('path');
-const { buildGroups, enabledIds, supported, BASE } = require('./profiles');
+const { buildGroups, enabledIds, supported, BASE, forName } = require('./profiles');
 const { PacServer } = require('./pac');
 const { DohSocks } = require('./dohsocks');
 const sysproxy = require('./sysproxy');
@@ -180,6 +180,7 @@ class Engine extends EventEmitter {
     this.pac = new PacServer();
     this.bye = null;
     this.front = null; // SOCKS5-переходник с DNS-over-HTTPS перед ByeDPI
+    this.extra = []; // отдельные ByeDPI для сервисов без SNI (match_all), когда включено несколько сервисов
     this.running = false;
     this.socksPort = 0;
   }
@@ -219,7 +220,12 @@ class Engine extends EventEmitter {
       return false;
     }
     this.log('Стратегии: ' + sel.map((s) => `${s.profile.name}=${s.strategy}`).join(', '));
-    const args = buildGroups(sel);
+    // Сервисы match_all (чат WhatsApp идёт по Noise без SNI) не может поймать фильтр --hosts: он смотрит только на SNI.
+    // Когда включено несколько сервисов, такому сервису нужен свой ByeDPI без фильтра; переходник направляет в него
+    // домены сервиса по имени (имя известно до подключения, в отличие от трафика без SNI).
+    const activeSel = sel.filter((s) => s.strategy !== 'none');
+    const dedicated = activeSel.length > 1 ? activeSel.filter((s) => s.profile.matchAll) : [];
+    const args = buildGroups(sel.filter((s) => !dedicated.includes(s)));
 
     const preferred = this.store.get('socksPort', 18080);
     const port = (await canListen(preferred)) ? preferred : await freePort();
@@ -230,14 +236,31 @@ class Engine extends EventEmitter {
     if (!(await bye.start(port, [...BASE, ...args]))) return false;
     this.bye = bye;
 
+    const routes = [];
+    for (const d of dedicated) {
+      const dport = await freePort();
+      const extra = new ByeDpi(this.bin);
+      extra.on('log', (l) => this.log(`byedpi (${d.profile.name}): ` + l));
+      if (!(await extra.start(dport, [...BASE, ...forName(d.strategy)]))) {
+        this.log(`Не удалось запустить отдельный ByeDPI для ${d.profile.name}`);
+        await this.stopExtras();
+        await bye.stop();
+        this.bye = null;
+        return false;
+      }
+      this.extra.push(extra);
+      routes.push({ name: d.profile.name, domains: d.profile.domains.map((x) => x.toLowerCase()), port: dport });
+    }
+
     // Браузер ходит не прямо в ByeDPI, а через переходник: он сам определяет адрес домена через DNS-over-HTTPS.
     // Системный DNS провайдера часто режет или подменяет адреса (в журнале: "byedpi: not resolved: ..."), а ByeDPI
     // использует именно его.
-    const front = new DohSocks({ upstreamPort: port, log: (m) => this.log(m) });
+    const front = new DohSocks({ upstreamPort: port, routes, log: (m) => this.log(m) });
     try {
       await front.start();
     } catch (e) {
       this.log('Не удалось запустить DNS-переходник: ' + e.message);
+      await this.stopExtras();
       await bye.stop();
       this.bye = null;
       return false;
@@ -261,9 +284,25 @@ class Engine extends EventEmitter {
       this.log('Не удалось настроить системный прокси: ' + e.message);
       this.pac.update([], 0);
       await this.stopFront();
+      await this.stopExtras();
       await bye.stop();
       this.bye = null;
       return false;
+    }
+
+    for (const x of this.extra) {
+      x.on('exit', () => {
+        if (this.running && this.bye === bye) {
+          this.log('Отдельный ByeDPI остановился неожиданно, защита выключена');
+          this.running = false;
+          this.pac.update([], 0);
+          this.stopFront();
+          this.stopExtras();
+          bye.stop();
+          this.bye = null;
+          this.emit('changed');
+        }
+      });
     }
 
     bye.on('exit', () => {
@@ -272,6 +311,7 @@ class Engine extends EventEmitter {
         this.running = false;
         this.pac.update([], 0);
         this.stopFront();
+        this.stopExtras();
         this.bye = null;
         this.emit('changed');
       }
@@ -280,6 +320,12 @@ class Engine extends EventEmitter {
     this.log(`Защита включена. SOCKS5 127.0.0.1:${front.port} (DNS через DoH) -> ByeDPI :${port}`);
     this.emit('changed');
     return true;
+  }
+
+  async stopExtras() {
+    const list = this.extra;
+    this.extra = [];
+    await Promise.all(list.map((x) => x.stop().catch(() => {})));
   }
 
   async stopFront() {
@@ -294,6 +340,7 @@ class Engine extends EventEmitter {
     this.running = false;
     this.pac.update([], 0);
     await this.stopFront();
+    await this.stopExtras();
     if (this.bye) {
       const b = this.bye;
       this.bye = null;

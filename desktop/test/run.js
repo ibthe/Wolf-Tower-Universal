@@ -423,6 +423,26 @@ const config = loadConfig([path.join(root, 'profiles', 'profiles.json')]);
       await engine.stop();
       busy.close();
     });
+    await test('движок: WhatsApp (match_all) среди нескольких сервисов получает отдельный ByeDPI без фильтра', async () => {
+      store.set('enabled', ['youtube', 'instagram', 'whatsapp']);
+      store.set('strategy_whatsapp', 'disorder');
+      logs.length = 0;
+      assert.strictEqual(await engine.start(), true, logs.join('\n'));
+      const startLines = logs.filter((l) => l.includes('Запуск ByeDPI'));
+      assert.strictEqual(startLines.length, 2, startLines.join('\n'));
+      const main = startLines.find((l) => !l.includes('(WhatsApp)'));
+      const wa = startLines.find((l) => l.includes('(WhatsApp)'));
+      assert(main.includes('--hosts') && !main.includes('whatsapp.com'), 'в основном ByeDPI нет группы WhatsApp');
+      assert(wa && !wa.includes('--hosts'), 'отдельный ByeDPI для WhatsApp работает без фильтра по SNI');
+      assert.strictEqual(engine.extra.length, 1);
+      await engine.stop();
+      assert.strictEqual(engine.extra.length, 0, 'после остановки отдельные процессы закрыты');
+      store.set('enabled', ['whatsapp']);
+      logs.length = 0;
+      assert.strictEqual(await engine.start(), true, logs.join('\n'));
+      assert.strictEqual(engine.extra.length, 0, 'один сервис: как раньше, один ByeDPI без фильтра');
+      await engine.stop();
+    });
     await engine.shutdown();
   } else {
     results.push('SKIP движок с реальным ByeDPI (задайте WT_TEST_CIADPI=путь к ciadpi)');
@@ -562,6 +582,28 @@ const config = loadConfig([path.join(root, 'profiles', 'profiles.json')]);
     fake.close();
     assert.strictEqual(answer, 'ok:hi');
     assert.ok(seen.includes('127.0.0.1'));
+  });
+
+  await test('DNS-переходник: домены сервиса без SNI уходят в отдельный ByeDPI, остальные в основной', async () => {
+    const seenMain = [];
+    const seenWa = [];
+    const main = await fakeSocksUpstream([], seenMain);
+    const wa = await fakeSocksUpstream([], seenWa);
+    const front = new DohSocks({
+      upstreamPort: main.address().port,
+      routes: [{ name: 'WhatsApp', domains: ['whatsapp.com', 'whatsapp.net'], port: wa.address().port }],
+      doh: async (name) => ({ ips: [/\.whatsapp\.(net|com)$/.test(name) ? '127.0.0.1' : '127.0.0.2'], ttl: 60 }),
+    });
+    await front.start();
+    assert.strictEqual(await viaFront(front, 'g.whatsapp.net'), 'ok:hi');
+    assert.strictEqual(await viaFront(front, 'web.whatsapp.com'), 'ok:hi');
+    assert.strictEqual(await viaFront(front, 'www.example.org'), 'ok:hi');
+    assert.strictEqual(await viaFront(front, 'notwhatsapp.com'), 'ok:hi'); // похожее имя не должно попасть в маршрут
+    await front.stop();
+    main.close();
+    wa.close();
+    assert.deepStrictEqual(seenWa, ['127.0.0.1', '127.0.0.1']);
+    assert.deepStrictEqual(seenMain, ['127.0.0.2', '127.0.0.2']);
   });
 
   console.log(results.join('\n'));
