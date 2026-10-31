@@ -180,7 +180,12 @@ async function connectViaUpstream(upstreamPort, ip, port, timeoutMs = 8000, trac
 const FAMILIES = [
   {
     key: 'meta',
-    suffixes: ['instagram.com', 'cdninstagram.com', 'instagr.am', 'ig.me', 'facebook.com', 'facebook.net', 'fb.com', 'fbcdn.net', 'fbsbx.com'],
+    // Веб-хосты WhatsApp (сайт, статика, картинки) обслуживаются теми же серверами. Чат (g.whatsapp.net и т. п.)
+    // говорит не по HTTPS, ему подходит только свой адрес, поэтому whatsapp.net целиком сюда не входит.
+    suffixes: [
+      'instagram.com', 'cdninstagram.com', 'instagr.am', 'ig.me', 'facebook.com', 'facebook.net', 'fb.com', 'fbcdn.net', 'fbsbx.com',
+      'whatsapp.com', 'wa.me', 'static.whatsapp.net', 'mmg.whatsapp.net', 'pps.whatsapp.net',
+    ],
     siblings: ['i.instagram.com', 'graph.instagram.com', 'graph.facebook.com', 'static.xx.fbcdn.net'],
   },
 ];
@@ -289,13 +294,14 @@ class DohSocks {
    * @param {{upstreamPort: number, routes?: {name: string, domains: string[], port: number}[], log?: Function}} o
    * routes: домены, которые идут не в основной ByeDPI, а в отдельный (для сервисов без SNI, например чат WhatsApp).
    */
-  constructor({ upstreamPort, routes = [], log = () => {}, doh = dohResolve, staggerMs = 1500 }) {
+  constructor({ upstreamPort, routes = [], log = () => {}, doh = dohResolve, staggerMs = 1500, connectTimeoutMs = 8000 }) {
     this.upstreamPort = upstreamPort;
     this.routes = routes;
     this.seen = new Set(); // хосты, о первом соединении с которыми уже записано в журнал
     this.log = log;
     this.doh = doh;
     this.staggerMs = staggerMs;
+    this.connectTimeoutMs = connectTimeoutMs;
     this.server = null;
     this.port = 0;
     this.sockets = new Set();
@@ -342,11 +348,15 @@ class DohSocks {
     return this.routes.find((r) => r.domains.some((d) => h === d || h.endsWith('.' + d))) || null;
   }
 
-  noteFail(host, why) {
+  noteFail(host, why, ips) {
     const last = this.failed.get(host) || 0;
     if (Date.now() - last > 30000) {
       this.failed.set(host, Date.now());
-      this.log(`DNS: не удалось определить адрес ${host} (${why})`);
+      this.log(
+        ips
+          ? `Не удалось подключиться к ${host} [${ips.join(', ')}] (${why}): адреса, вероятно, закрыты провайдером`
+          : `DNS: не удалось определить адрес ${host} (${why})`
+      );
     }
   }
 
@@ -395,13 +405,14 @@ class DohSocks {
     try {
       r = await raceConnect(route ? route.port : this.upstreamPort, ips, port, {
         staggerMs: this.staggerMs,
+        timeoutMs: this.connectTimeoutMs,
         track: (sock) => {
           this.sockets.add(sock);
           sock.once('close', () => this.sockets.delete(sock));
         },
       });
     } catch (e) {
-      this.noteFail(host, e.message);
+      this.noteFail(host, e.message, ips);
       client.write(FAIL(5)); // отказ в соединении
       return client.end();
     }

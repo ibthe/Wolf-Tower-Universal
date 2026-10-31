@@ -584,6 +584,43 @@ const config = loadConfig([path.join(root, 'profiles', 'profiles.json')]);
     assert.ok(seen.includes('127.0.0.1'));
   });
 
+  await test('DNS-переходник: закрытый адрес web.whatsapp.com заменяется рабочим адресом Meta', async () => {
+    const seen = [];
+    const fake = await fakeSocksUpstream(['203.0.113.9'], seen);
+    const front = new DohSocks({
+      upstreamPort: fake.address().port,
+      staggerMs: 100,
+      doh: async (name) => {
+        if (name === 'site-a.whatsapp.com') return { ips: ['203.0.113.9'], ttl: 60 };
+        if (name === 'i.instagram.com') return { ips: ['127.0.0.1'], ttl: 60 };
+        throw new Error('нет');
+      },
+    });
+    await front.start();
+    const answer = await viaFront(front, 'site-a.whatsapp.com');
+    await front.stop();
+    fake.close();
+    assert.strictEqual(answer, 'ok:hi');
+    assert.ok(seen.includes('127.0.0.1'));
+  });
+
+  await test('DNS-переходник: чат WhatsApp (g.whatsapp.net) не получает чужие адреса Meta', async () => {
+    const seen = [];
+    const fake = await fakeSocksUpstream(['203.0.113.10'], seen);
+    const front = new DohSocks({
+      upstreamPort: fake.address().port,
+      staggerMs: 100,
+      connectTimeoutMs: 400,
+      doh: async (name) => (name === 'chat-a.whatsapp.net' ? { ips: ['203.0.113.10'], ttl: 60 } : { ips: ['127.0.0.1'], ttl: 60 }),
+    });
+    await front.start();
+    const answer = await viaFront(front, 'chat-a.whatsapp.net');
+    await front.stop();
+    fake.close();
+    assert.strictEqual(answer, 'fail:5');
+    assert.deepStrictEqual(seen, ['203.0.113.10']);
+  });
+
   await test('DNS-переходник: домены сервиса без SNI уходят в отдельный ByeDPI, остальные в основной', async () => {
     const seenMain = [];
     const seenWa = [];
@@ -595,8 +632,8 @@ const config = loadConfig([path.join(root, 'profiles', 'profiles.json')]);
       doh: async (name) => ({ ips: [/\.whatsapp\.(net|com)$/.test(name) ? '127.0.0.1' : '127.0.0.2'], ttl: 60 }),
     });
     await front.start();
-    assert.strictEqual(await viaFront(front, 'g.whatsapp.net'), 'ok:hi');
-    assert.strictEqual(await viaFront(front, 'web.whatsapp.com'), 'ok:hi');
+    assert.strictEqual(await viaFront(front, 'route-a.whatsapp.net'), 'ok:hi');
+    assert.strictEqual(await viaFront(front, 'route-b.whatsapp.com'), 'ok:hi');
     assert.strictEqual(await viaFront(front, 'www.example.org'), 'ok:hi');
     assert.strictEqual(await viaFront(front, 'notwhatsapp.com'), 'ok:hi'); // похожее имя не должно попасть в маршрут
     await front.stop();
