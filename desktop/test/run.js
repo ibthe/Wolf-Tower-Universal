@@ -622,6 +622,89 @@ const config = loadConfig([path.join(root, 'profiles', 'profiles.json')]);
     assert.deepStrictEqual(seen, ['203.0.113.10']);
   });
 
+  // поддельный ByeDPI: соединение с "молчащими" адресами принимает, но на запрос не отвечает (как обрыв после ClientHello)
+  const fakeSilentUpstream = async (silentIps, seen) => {
+    const srv = net.createServer((s) => {
+      s.on('error', () => {});
+      s.once('data', () => {
+        s.write(Buffer.from([5, 0]));
+        s.once('data', (d) => {
+          const ip = [...d.subarray(4, 8)].join('.');
+          seen.push(ip);
+          s.write(Buffer.from([5, 0, 0, 1, 0, 0, 0, 0, 0, 0]));
+          if (silentIps.includes(ip)) return s.on('data', () => {}); // принимаем и молчим
+          s.on('data', (x) => s.write(Buffer.concat([Buffer.from('ok:'), x])));
+        });
+      });
+    });
+    await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+    return srv;
+  };
+  // клиент шлёт заготовку TLS ClientHello; возвращает ответ или 'closed', если соединение закрыли без ответа
+  const viaFrontTls = (front, host) =>
+    new Promise((resolve, reject) => {
+      const c = net.connect(front.port, '127.0.0.1');
+      let st = 0;
+      c.on('connect', () => c.write(Buffer.from([5, 1, 0])));
+      c.on('data', (d) => {
+        if (st === 0) {
+          st = 1;
+          const h = Buffer.from(host);
+          c.write(Buffer.concat([Buffer.from([5, 1, 0, 3, h.length]), h, Buffer.from([1, 187])]));
+        } else if (st === 1) {
+          st = 2;
+          if (d[1] !== 0) return resolve('fail:' + d[1]), c.destroy();
+          c.write(Buffer.from([0x16, 0x03, 0x01, 0x00, 0x05, 1, 2, 3, 4, 5]));
+        } else {
+          resolve(d.toString().replace(/[^ -~]/g, '.'));
+          c.destroy();
+        }
+      });
+      c.on('close', () => resolve('closed'));
+      c.on('error', reject);
+      setTimeout(() => reject(new Error('таймаут теста')), 8000);
+    });
+
+  await test('DNS-переходник: сервер принял соединение, но молчит на ClientHello: запрос повторяется на другом адресе', async () => {
+    const seen = [];
+    const fake = await fakeSilentUpstream(['203.0.113.31'], seen);
+    const front = new DohSocks({
+      upstreamPort: fake.address().port,
+      staggerMs: 100,
+      firstByteMs: 400,
+      doh: async () => ({ ips: ['203.0.113.31', '127.0.0.1'], ttl: 60 }),
+    });
+    await front.start();
+    const t0 = Date.now();
+    const answer = await viaFrontTls(front, 'silent-first.example');
+    await front.stop();
+    fake.close();
+    assert.ok(answer.startsWith('ok:'), answer);
+    assert.ok(Date.now() - t0 < 4000);
+    assert.deepStrictEqual(seen, ['203.0.113.31', '127.0.0.1']);
+  });
+
+  await test('DNS-переходник: единственный адрес молчит: соединение закрывается быстро, а не висит', async () => {
+    const seen = [];
+    const fake = await fakeSilentUpstream(['203.0.113.32'], seen);
+    const logs = [];
+    const front = new DohSocks({
+      upstreamPort: fake.address().port,
+      staggerMs: 100,
+      firstByteMs: 400,
+      log: (m) => logs.push(m),
+      doh: async () => ({ ips: ['203.0.113.32'], ttl: 60 }),
+    });
+    await front.start();
+    const t0 = Date.now();
+    const answer = await viaFrontTls(front, 'silent-only.example');
+    await front.stop();
+    fake.close();
+    assert.strictEqual(answer, 'closed');
+    assert.ok(Date.now() - t0 < 3000, 'закрыто быстро');
+    assert.ok(logs.some((l) => l.startsWith('Сервер не ответил на запрос')), logs.join('\n'));
+  });
+
   await test('DNS-переходник: домены сервиса без SNI уходят в отдельный ByeDPI, остальные в основной', async () => {
     const seenMain = [];
     const seenWa = [];

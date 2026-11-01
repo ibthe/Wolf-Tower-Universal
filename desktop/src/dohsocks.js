@@ -284,6 +284,61 @@ function raceConnect(upstreamPort, ips, port, { staggerMs = 1500, timeoutMs = 80
   });
 }
 
+/**
+ * Первая порция данных клиента (для TLS собирается запись целиком). null, если клиент ничего не прислал за waitMs.
+ * Поток после чтения на паузе.
+ */
+function readFirstChunk(sock, waitMs) {
+  return new Promise((resolve) => {
+    let buf = Buffer.alloc(0);
+    let timer = null;
+    const done = (v) => {
+      clearTimeout(timer);
+      sock.off('data', onData);
+      sock.off('close', onEnd);
+      sock.off('end', onEnd);
+      sock.pause();
+      resolve(v);
+    };
+    const onData = (d) => {
+      buf = Buffer.concat([buf, d]);
+      const want = buf[0] === 0x16 && buf.length >= 5 ? 5 + buf.readUInt16BE(3) : 0;
+      if (buf[0] !== 0x16 || buf.length >= Math.min(want, 16384)) return done(buf);
+      clearTimeout(timer);
+      timer = setTimeout(() => done(buf), 2000); // запись пришла не целиком: ждём остаток недолго
+    };
+    const onEnd = () => done(buf.length ? buf : null);
+    timer = setTimeout(() => done(null), waitMs);
+    sock.on('data', onData);
+    sock.once('close', onEnd);
+    sock.once('end', onEnd);
+    sock.resume();
+  });
+}
+
+/** Отправляет hello и ждёт первый ответ сервера. null, если за ms ничего не пришло или соединение закрылось. */
+function waitFirstByte(up, hello, ms) {
+  return new Promise((resolve) => {
+    let timer = null;
+    const finish = (v) => {
+      clearTimeout(timer);
+      up.off('data', onData);
+      up.off('close', onClose);
+      up.off('error', onClose);
+      if (v) up.pause();
+      resolve(v);
+    };
+    const onData = (d) => finish(d);
+    const onClose = () => finish(null);
+    up.on('data', onData);
+    up.once('close', onClose);
+    up.once('error', onClose);
+    timer = setTimeout(() => finish(null), ms);
+    up.write(hello);
+    up.resume();
+  });
+}
+
 const FAIL = (code) => Buffer.from([5, code, 0, 1, 0, 0, 0, 0, 0, 0]);
 
 class DohSocks {
@@ -294,7 +349,7 @@ class DohSocks {
    * @param {{upstreamPort: number, routes?: {name: string, domains: string[], port: number}[], log?: Function}} o
    * routes: домены, которые идут не в основной ByeDPI, а в отдельный (для сервисов без SNI, например чат WhatsApp).
    */
-  constructor({ upstreamPort, routes = [], log = () => {}, doh = dohResolve, staggerMs = 1500, connectTimeoutMs = 8000 }) {
+  constructor({ upstreamPort, routes = [], log = () => {}, doh = dohResolve, staggerMs = 1500, connectTimeoutMs = 8000, firstByteMs = 6000 }) {
     this.upstreamPort = upstreamPort;
     this.routes = routes;
     this.seen = new Set(); // хосты, о первом соединении с которыми уже записано в журнал
@@ -302,6 +357,7 @@ class DohSocks {
     this.doh = doh;
     this.staggerMs = staggerMs;
     this.connectTimeoutMs = connectTimeoutMs;
+    this.firstByteMs = firstByteMs;
     this.server = null;
     this.port = 0;
     this.sockets = new Set();
@@ -430,10 +486,18 @@ class DohSocks {
     // Долгие соединения (WebSocket чата) попадают в журнал только после закрытия, поэтому успех пишем сразу
     this.noteOk(host, r.ip, Date.now() - tRace);
     if (client.destroyed) return r.up.destroy();
-    r.up.on('error', () => client.destroy());
-    client.on('close', () => r.up.destroy());
-    r.up.on('close', () => client.destroy());
     client.setTimeout(0);
+    client.write(r.reply);
+    await this.relay(client, r, { host, port, ips, route });
+  }
+
+  /**
+   * Передача данных. Если клиент начинает с TLS ClientHello, а сервер за firstByteMs не ответил (оператор пропустил
+   * соединение, но режет запрос), адрес считается закрытым: запрос повторяется на следующем адресе, а если адресов
+   * больше нет, соединение закрывается сразу, а не через 30 секунд, и браузер быстро переключается сам.
+   */
+  async relay(client, first, { host, port, ips, route }) {
+    let cur = first;
     const t0 = Date.now();
     let sent = 0;
     let got = 0;
@@ -441,15 +505,79 @@ class DohSocks {
     const report = () => {
       if (reported) return;
       reported = true;
-      this.noteDone(host, r.ip, sent, got, Date.now() - t0);
+      this.noteDone(host, cur.ip, sent, got, Date.now() - t0);
     };
+    client.on('error', () => {});
+    client.once('close', () => {
+      report();
+      cur.up.destroy();
+    });
+
+    const hello = await readFirstChunk(client, 3000);
+    if (client.destroyed) return;
+    if (hello) sent += hello.length;
+    const isTls = hello && hello.length > 2 && hello[0] === 0x16 && hello[1] === 0x03;
+    if (isTls) {
+      const tried = new Set([cur.ip]);
+      for (let attempt = 0; ; attempt++) {
+        const ms = attempt === 0 ? this.firstByteMs : Math.max(2500, this.firstByteMs - 2000);
+        const reply = await waitFirstByte(cur.up, hello, ms);
+        if (client.destroyed) return;
+        if (reply) {
+          got += reply.length;
+          client.write(reply);
+          break;
+        }
+        markBad(cur.ip);
+        cur.up.destroy();
+        const rest = ips.filter((i) => !tried.has(i));
+        if (attempt >= 2 || !rest.length) {
+          this.noteSilent(host, cur.ip, rest.length === 0);
+          return client.destroy();
+        }
+        try {
+          cur = await raceConnect(route ? route.port : this.upstreamPort, rest, port, {
+            staggerMs: this.staggerMs,
+            timeoutMs: this.connectTimeoutMs,
+            track: (sock) => {
+              this.sockets.add(sock);
+              sock.once('close', () => this.sockets.delete(sock));
+            },
+          });
+        } catch (_) {
+          return client.destroy();
+        }
+        tried.add(cur.ip);
+        this.noteRetry(host, cur.ip);
+      }
+    } else if (hello) {
+      cur.up.write(hello);
+    }
+    const up = cur.up;
+    up.on('error', () => client.destroy());
+    up.once('close', () => {
+      report();
+      client.destroy();
+    });
     client.on('data', (d) => (sent += d.length));
-    r.up.on('data', (d) => (got += d.length));
-    client.once('close', report);
-    r.up.once('close', report);
-    client.write(r.reply);
-    client.pipe(r.up);
-    r.up.pipe(client);
+    up.on('data', (d) => (got += d.length));
+    client.pipe(up);
+    up.pipe(client);
+  }
+
+  noteSilent(host, ip, last) {
+    this.noteOnce(host + '#', `Сервер не ответил на запрос: ${host} (${ip}), соединение закрыто${last ? '' : ', другие адреса не помогли'}`);
+  }
+
+  noteRetry(host, ip) {
+    this.noteOnce(host + '>', `Адрес не ответил, повтор на другом: ${host} (${ip})`);
+  }
+
+  noteOnce(key, text) {
+    const last = this.failed.get(key) || 0;
+    if (Date.now() - last < 20000) return;
+    this.failed.set(key, Date.now());
+    this.log(text);
   }
 }
 

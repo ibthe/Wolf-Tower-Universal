@@ -7,6 +7,7 @@ import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
+import java.net.SocketTimeoutException
 import java.util.concurrent.Callable
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CountDownLatch
@@ -40,6 +41,7 @@ class DohSocksShim(
     private val routes: List<ShimRoute> = emptyList(),
     private val staggerMs: Long = 1500,
     private val connectTimeoutMs: Int = 8000,
+    private val firstByteMs: Int = 6000,
     private val resolver: (String) -> DohResult? = { Doh.resolve(it) },
 ) {
     companion object {
@@ -388,28 +390,112 @@ class DohSocksShim(
             if (isMeta(name)) metaGood = w.ip
             // Долгие соединения (WebSocket чата) попадают в журнал только после закрытия, поэтому успех пишем сразу
             note("$name~", 20_000, "Подключено: $name (${w.ip}), ${System.currentTimeMillis() - tRace} мс")
-            val u = w.sock
-            up = u
+            var cur: Winner = w
+            up = cur.sock
             reply(cout, 0)
 
+            // Если клиент начинает с TLS ClientHello, а сервер за firstByteMs не ответил (оператор пропустил соединение,
+            // но режет запрос), адрес считается закрытым: запрос повторяется на следующем адресе, а если адресов больше
+            // нет, соединение закрывается сразу, а не через 30 секунд, и приложение быстро переключается само.
+            var sent = 0L
+            var got = 0L
+            val hello = readFirstFlight(client)
+            if (hello != null) sent += hello.size
+            val isTls = hello != null && hello.size > 2 && hello[0].toInt() == 0x16 && hello[1].toInt() == 0x03
+            val route2 = route?.port ?: upstreamPort
+            if (hello != null && isTls) {
+                val tried = HashSet<String>()
+                tried.add(cur.ip)
+                var attempt = 0
+                while (true) {
+                    val ms = if (attempt == 0) firstByteMs else maxOf(2500, firstByteMs - 2000)
+                    val first = firstReply(cur.sock, hello, ms)
+                    if (first != null) {
+                        got += first.size
+                        cout.write(first)
+                        cout.flush()
+                        break
+                    }
+                    markBad(cur.ip)
+                    closeQuiet(cur.sock)
+                    val rest = ips.filter { it !in tried }
+                    if (attempt >= 2 || rest.isEmpty()) {
+                        note("$name#", 20_000, "Сервер не ответил на запрос: $name (${cur.ip}), соединение закрыто")
+                        return
+                    }
+                    val e2 = arrayOfNulls<String>(1)
+                    val next = race(rest, portBytes, route2, e2) ?: return
+                    tried.add(next.ip)
+                    cur = next
+                    up = cur.sock
+                    note("$name>", 20_000, "Адрес не ответил, повтор на другом: $name (${cur.ip})")
+                    attempt++
+                }
+            } else if (hello != null) {
+                cur.sock.getOutputStream().write(hello)
+                cur.sock.getOutputStream().flush()
+            }
+
+            val u = cur.sock
             client.soTimeout = 0
             u.soTimeout = 0
             val t0 = System.currentTimeMillis()
             val done = CountDownLatch(1)
-            var got = 0L
+            var got2 = 0L
             pool.execute {
-                got = pump(u, client)
+                got2 = pump(u, client)
                 done.countDown()
             }
-            val sent = pump(client, u)
+            val sent2 = pump(client, u)
             done.await(2, TimeUnit.MINUTES)
-            noteDone(name, w.ip, sent, got, System.currentTimeMillis() - t0)
+            noteDone(name, cur.ip, sent + sent2, got + got2, System.currentTimeMillis() - t0)
         } catch (_: Exception) {
         } finally {
             closeQuiet(client)
             closeQuiet(up)
             open.remove(client)
             if (up != null) open.remove(up)
+        }
+    }
+
+
+    /** Первая порция данных клиента (для TLS собирается запись целиком). null, если за 3 секунды ничего или клиент закрылся. */
+    private fun readFirstFlight(client: Socket): ByteArray? {
+        return try {
+            client.soTimeout = 3000
+            val inp = client.getInputStream()
+            val buf = ByteArray(16384)
+            var n = inp.read(buf)
+            if (n <= 0) return null
+            if (buf[0].toInt() == 0x16 && n >= 5) {
+                val want = minOf(5 + (((buf[3].toInt() and 0xff) shl 8) or (buf[4].toInt() and 0xff)), buf.size)
+                client.soTimeout = 2000 // запись пришла не целиком: ждём остаток недолго
+                while (n < want) {
+                    val k = inp.read(buf, n, want - n)
+                    if (k <= 0) break
+                    n += k
+                }
+            }
+            buf.copyOf(n)
+        } catch (_: SocketTimeoutException) {
+            null
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    /** Отправляет hello и ждёт первый ответ сервера. null, если за ms ничего не пришло или соединение закрылось. */
+    private fun firstReply(sock: Socket, hello: ByteArray, ms: Int): ByteArray? {
+        return try {
+            sock.soTimeout = ms
+            val out = sock.getOutputStream()
+            out.write(hello)
+            out.flush()
+            val buf = ByteArray(16384)
+            val n = sock.getInputStream().read(buf)
+            if (n <= 0) null else buf.copyOf(n)
+        } catch (_: Exception) {
+            null
         }
     }
 

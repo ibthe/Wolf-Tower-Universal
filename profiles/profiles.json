@@ -114,7 +114,8 @@
         "www.instagram.com",
         "i.instagram.com",
         "graph.instagram.com",
-        "scontent.cdninstagram.com"
+        "scontent.cdninstagram.com",
+        "static.cdninstagram.com"
       ],
       "block_quic": true,
       "match_all": false

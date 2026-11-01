@@ -1,6 +1,5 @@
 package com.wolftower.app
 
-import java.net.URL
 import java.util.concurrent.Callable
 import java.util.concurrent.ExecutorCompletionService
 import java.util.concurrent.Executors
@@ -48,7 +47,7 @@ object Doh {
     private fun query(template: String, host: String, timeoutMs: Int): DohResult? {
         var c: HttpsURLConnection? = null
         return try {
-            c = URL(String.format(template, host)).openConnection() as HttpsURLConnection
+            c = java.net.URI(String.format(template, host)).toURL().openConnection() as HttpsURLConnection
             c.connectTimeout = timeoutMs
             c.readTimeout = timeoutMs
             c.setRequestProperty("accept", "application/dns-json")
