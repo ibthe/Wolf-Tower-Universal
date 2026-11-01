@@ -50,6 +50,7 @@ class DohSocksShim(
         private val META_SUFFIXES = listOf(
             "instagram.com", "cdninstagram.com", "instagr.am", "ig.me", "facebook.com", "facebook.net", "fb.com",
             "fbcdn.net", "fbsbx.com", "whatsapp.com", "wa.me", "static.whatsapp.net", "mmg.whatsapp.net", "pps.whatsapp.net",
+            "cdn.whatsapp.net", "crashlogs.whatsapp.net",
         )
         private val META_SIBLINGS = listOf("i.instagram.com", "graph.instagram.com", "graph.facebook.com", "static.xx.fbcdn.net")
 
@@ -374,6 +375,7 @@ class DohSocksShim(
             }
 
             val err = arrayOfNulls<String>(1)
+            val tRace = System.currentTimeMillis()
             val w = race(ips, portBytes, route?.port ?: upstreamPort, err)
             if (w == null) {
                 note(
@@ -384,6 +386,8 @@ class DohSocksShim(
                 return
             }
             if (isMeta(name)) metaGood = w.ip
+            // Долгие соединения (WebSocket чата) попадают в журнал только после закрытия, поэтому успех пишем сразу
+            note("$name~", 20_000, "Подключено: $name (${w.ip}), ${System.currentTimeMillis() - tRace} мс")
             val u = w.sock
             up = u
             reply(cout, 0)

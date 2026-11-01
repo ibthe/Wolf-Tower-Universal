@@ -184,7 +184,7 @@ const FAMILIES = [
     // говорит не по HTTPS, ему подходит только свой адрес, поэтому whatsapp.net целиком сюда не входит.
     suffixes: [
       'instagram.com', 'cdninstagram.com', 'instagr.am', 'ig.me', 'facebook.com', 'facebook.net', 'fb.com', 'fbcdn.net', 'fbsbx.com',
-      'whatsapp.com', 'wa.me', 'static.whatsapp.net', 'mmg.whatsapp.net', 'pps.whatsapp.net',
+      'whatsapp.com', 'wa.me', 'static.whatsapp.net', 'mmg.whatsapp.net', 'pps.whatsapp.net', 'cdn.whatsapp.net', 'crashlogs.whatsapp.net',
     ],
     siblings: ['i.instagram.com', 'graph.instagram.com', 'graph.facebook.com', 'static.xx.fbcdn.net'],
   },
@@ -342,6 +342,14 @@ class DohSocks {
     );
   }
 
+  noteOk(host, ip, ms) {
+    const key = host + '~';
+    const last = this.failed.get(key) || 0;
+    if (Date.now() - last < 20000) return;
+    this.failed.set(key, Date.now());
+    this.log(`Подключено: ${host} (${ip}), ${ms} мс`);
+  }
+
   /** Отдельный маршрут для домена (поддомены тоже) или null. */
   routeFor(host) {
     const h = host.toLowerCase();
@@ -401,6 +409,7 @@ class DohSocks {
       this.seen.add(host);
       this.log(`Запрос: ${host}:${port} [${ips.join(', ')}]${route ? ' -> отдельный ByeDPI ' + route.name : ''}`);
     }
+    const tRace = Date.now();
     let r;
     try {
       r = await raceConnect(route ? route.port : this.upstreamPort, ips, port, {
@@ -418,6 +427,8 @@ class DohSocks {
     }
     const fam = familyOf(host);
     if (fam) familyGood.set(fam.key, r.ip);
+    // Долгие соединения (WebSocket чата) попадают в журнал только после закрытия, поэтому успех пишем сразу
+    this.noteOk(host, r.ip, Date.now() - tRace);
     if (client.destroyed) return r.up.destroy();
     r.up.on('error', () => client.destroy());
     client.on('close', () => r.up.destroy());
