@@ -58,9 +58,34 @@ object Settings {
     @Suppress("UNUSED_PARAMETER")
     fun blockQuicPref(ctx: Context): Boolean? = null
 
-    fun dohEnabled(ctx: Context): Boolean = prefs(ctx).getBoolean("doh", false)
+    /**
+     * Защищённый DNS (DoH-переходник перед ByeDPI) включён по умолчанию: без него ByeDPI определяет адреса через DNS
+     * оператора, который режет или подменяет ответы для api-хостов (i.instagram.com, graph.facebook.com,
+     * graph.whatsapp.com): лента открывается, а комментарии и статусы нет. Ключ новый, старые значения игнорируются.
+     */
+    fun dohEnabled(ctx: Context): Boolean = prefs(ctx).getBoolean("doh2", true)
 
-    fun setDoh(ctx: Context, value: Boolean) = prefs(ctx).edit().putBoolean("doh", value).apply()
+    fun setDoh(ctx: Context, value: Boolean) = prefs(ctx).edit().putBoolean("doh2", value).apply()
+
+    /** Найденный автоподбором путь: стратегия, число открывшихся адресов, задержка (мс) и скорость (КБ/с). */
+    data class RankEntry(val strategy: String, val ok: Int, val total: Int, val latencyMs: Int, val kbps: Int)
+
+    /** Итог последнего подбора для сервиса, лучший путь первым (пусто, если подбора ещё не было). */
+    fun rankingFor(ctx: Context, profileId: String): List<RankEntry> {
+        val raw = prefs(ctx).getString("rank_$profileId", null) ?: return emptyList()
+        return raw.split(';').mapNotNull { item ->
+            val f = item.split('|')
+            if (f.size != 5) return@mapNotNull null
+            val ok = f[1].toIntOrNull() ?: return@mapNotNull null
+            val total = f[2].toIntOrNull() ?: return@mapNotNull null
+            RankEntry(f[0], ok, total, f[3].toIntOrNull() ?: 0, f[4].toIntOrNull() ?: 0)
+        }
+    }
+
+    fun setRankingFor(ctx: Context, profileId: String, list: List<RankEntry>) {
+        val raw = list.joinToString(";") { "${it.strategy}|${it.ok}|${it.total}|${it.latencyMs}|${it.kbps}" }
+        prefs(ctx).edit().putString("rank_$profileId", raw).apply()
+    }
 
     fun notifAsked(ctx: Context): Boolean = prefs(ctx).getBoolean("notif_asked", false)
 

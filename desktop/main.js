@@ -44,7 +44,11 @@ function appendLog(msg) {
 function snapshot() {
   const st = license.status();
   const chosen = {};
-  for (const p of config.profiles) chosen[p.id] = strategyFor(p.id);
+  const ranking = {};
+  for (const p of config.profiles) {
+    chosen[p.id] = strategyFor(p.id);
+    ranking[p.id] = store.get('ranking_' + p.id, []);
+  }
   return {
     platform: process.platform,
     running: engine.running,
@@ -56,6 +60,7 @@ function snapshot() {
     strategies: config.strategies.filter((s) => supported(s)),
     enabled: enabledIds(),
     chosen,
+    ranking, // найденные автоподбором пути по сервисам: лучший первым, с замерами
     license: {
       text: license.describe(st),
       licensed: st.kind === 'licensed',
@@ -122,7 +127,9 @@ async function runProbe() {
   pushState();
   try {
     const candidates = ['none', ...config.strategies.filter((s) => supported(s))];
+    const stats = {};
     const counts = await autoprobe.score({
+      stats,
       makeProcess: () => new ByeDpi(engine.bin),
       freePort,
       forName: (s) => [...BASE, ...forName(s)],
@@ -146,13 +153,27 @@ async function runProbe() {
           continue;
         }
         // Проба смотрит только TLS: для match_all-сервиса "без обхода" не выбираем (чат идёт без SNI)
-        const { best, ok } = autoprobe.chooseBest(counts[p.id], p.matchAll ? candidates.filter((c) => c !== 'none') : candidates);
-        if (!best) {
+        const list = p.matchAll ? candidates.filter((c) => c !== 'none') : candidates;
+        const ranking = autoprobe.rank(stats[p.id], list, total);
+        store.set('ranking_' + p.id, ranking);
+        const top = ranking[0];
+        if (!top) {
           lines.push(trf('{0}: ничего не сработало (0/{1}). Возможна блокировка по IP или подмена DNS.', p.name, total));
         } else {
-          store.set('strategy_' + p.id, best);
-          scores[p.id] = `${ok}/${total}`;
-          lines.push(trf('{0}: {1} ({2}/{3})', p.name, best === 'none' ? tr('обход не нужен') : best, ok, total));
+          store.set('strategy_' + p.id, top.strategy);
+          scores[p.id] = `${top.ok}/${total}`;
+          lines.push(
+            trf(
+              '{0}: {1} ({2}/{3}, {4} мс, {5} КБ/с), найдено путей: {6}',
+              p.name,
+              top.strategy === 'none' ? tr('обход не нужен') : top.strategy,
+              top.ok,
+              total,
+              top.latencyMs,
+              top.kbps,
+              ranking.length
+            )
+          );
         }
       }
       probe = { running: false, done: true, progress: '', report: lines.join('\n'), scores };

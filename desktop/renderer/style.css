@@ -119,7 +119,7 @@ input[type=text]:focus { border-color: var(--green); }
 .chip.on { background: var(--deep); border-color: var(--green); color: #fff; }
 .chip:disabled { opacity: .5; cursor: default; }
 
-/* ---- сервисы: значок, название, переключатель (красный у YouTube, розовый у Instagram) */
+/* ---- сервисы: значок, название, переключатель (красный у YouTube, розовый у Instagram, зелёный у WhatsApp) */
 .svc-list { display: grid; gap: 12px; }
 .svc { display: flex; align-items: center; gap: 12px; cursor: pointer; }
 .svc-ico { width: 36px; height: 36px; flex: none; }
@@ -130,5 +130,6 @@ input[type=text]:focus { border-color: var(--green); }
 .switch::after { content: ""; position: absolute; top: 3px; left: 3px; width: 20px; height: 20px; border-radius: 50%; background: var(--dim); transition: transform .2s, background .2s; }
 .switch:checked { background: #ff0000; border-color: transparent; }
 .switch.instagram:checked { background: #d62976; }
+.switch.whatsapp:checked { background: #25d366; }
 .switch:checked::after { transform: translateX(18px); background: #fff; }
 .switch:disabled { opacity: .5; cursor: default; }

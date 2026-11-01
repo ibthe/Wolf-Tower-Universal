@@ -8,6 +8,9 @@ import java.net.SocketTimeoutException
 import javax.net.ssl.SSLSocket
 import javax.net.ssl.SSLSocketFactory
 
+/** Итог одной пробы: успех, задержка до готового TLS (мс) и скорость чтения страницы (КБ/с). */
+data class ProbeResult(val ok: Boolean, val latencyMs: Int = 0, val kbps: Int = 0)
+
 /** Проверка доступности сайта через локальный SOCKS5 ByeDPI. */
 object Prober {
     /** Если страница больше этого размера, она должна дойти хотя бы до него (ловит обрыв после ~16 КБ). */
@@ -26,8 +29,18 @@ object Prober {
         timeoutMs: Int = 5000,
         minBytes: Int = DEFAULT_MIN_BYTES,
         budgetMs: Int = 0,
-    ): Boolean {
+    ): Boolean = measure(host, socksPort, timeoutMs, minBytes, budgetMs).ok
+
+    /** То же, что [probe], но ещё меряет задержку (до готового TLS) и скорость чтения: по ним сравниваются рабочие пути. */
+    fun measure(
+        host: String,
+        socksPort: Int,
+        timeoutMs: Int = 5000,
+        minBytes: Int = DEFAULT_MIN_BYTES,
+        budgetMs: Int = 0,
+    ): ProbeResult {
         var raw: Socket? = null
+        val t0 = System.nanoTime()
         return try {
             raw = Socket(Proxy(Proxy.Type.SOCKS, InetSocketAddress("127.0.0.1", socksPort)))
             raw.connect(InetSocketAddress.createUnresolved(host, 443), timeoutMs)
@@ -39,6 +52,7 @@ object Prober {
             ssl.sslParameters = params
             ssl.soTimeout = timeoutMs
             ssl.startHandshake()
+            val latencyMs = ((System.nanoTime() - t0) / 1_000_000).toInt()
 
             val out = ssl.outputStream
             out.write(
@@ -74,9 +88,11 @@ object Prober {
                 total += n
             }
             val statusOk = head.toString(Charsets.ISO_8859_1).startsWith("HTTP/")
-            statusOk && (eof || total >= minBytes)
+            val ok = statusOk && (eof || total >= minBytes)
+            val readMs = maxOf(1L, (System.nanoTime() - startNs) / 1_000_000)
+            ProbeResult(ok, latencyMs, if (ok) (total * 1000L / readMs / 1024).toInt() else 0)
         } catch (_: Exception) {
-            false
+            ProbeResult(false)
         } finally {
             try {
                 raw?.close()

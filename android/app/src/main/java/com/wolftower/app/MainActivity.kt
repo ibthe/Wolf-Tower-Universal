@@ -189,7 +189,7 @@ class MainActivity : ComponentActivity() {
                         )
                         Column {
                             Text("Wolf Tower", color = WT.Text, fontSize = 20.sp, fontWeight = FontWeight.Bold)
-                            Text(tr("Разблокировка YouTube и Instagram"), color = WT.TextDim, fontSize = 13.sp)
+                            Text(tr("Разблокировка YouTube, Instagram и WhatsApp"), color = WT.TextDim, fontSize = 13.sp)
                         }
                     }
 
@@ -473,6 +473,11 @@ class MainActivity : ComponentActivity() {
                     if (advancedOpen) {
                         WtCard {
                             Text(tr("Выбрать стратегию вручную"), color = WT.Text, fontWeight = FontWeight.Medium, fontSize = 15.sp)
+                            Text(
+                                tr("После автоподбора найденные пути идут первыми: ★ лучший по скорости и задержке, остальные можно выбрать вручную."),
+                                color = WT.TextDim,
+                                fontSize = 12.sp,
+                            )
                             FlowRow(
                                 horizontalArrangement = Arrangement.spacedBy(8.dp),
                                 verticalArrangement = Arrangement.spacedBy(8.dp),
@@ -495,9 +500,17 @@ class MainActivity : ComponentActivity() {
                                 horizontalArrangement = Arrangement.spacedBy(8.dp),
                                 verticalArrangement = Arrangement.spacedBy(8.dp),
                             ) {
-                                (listOf("none") + config.strategies).forEach { s ->
+                                // Найденные автоподбором пути идут первыми (лучший по числу открытых адресов, скорости и
+                                // задержке первым) и подписаны замерами, остальные стратегии ниже. Выбрать можно любой.
+                                val ranking = remember(advId, probe.done, probe.running) { Settings.rankingFor(ctx, advId) }
+                                val rankOf = ranking.associateBy { it.strategy }
+                                val all = listOf("none") + config.strategies
+                                val ordered = ranking.map { it.strategy }.filter { it in all } + all.filter { it !in rankOf }
+                                ordered.forEachIndexed { index, s ->
+                                    val r = rankOf[s]
+                                    val measured = if (r != null) trf(" · {0}/{1} · {2} мс · {3} КБ/с", r.ok, r.total, r.latencyMs, r.kbps) else ""
                                     WtChip(
-                                        text = strategyLabel(s),
+                                        text = (if (r != null && index == 0) "★ " else "") + strategyLabel(s) + measured,
                                         selected = s == strategy,
                                         enabled = !running,
                                         onClick = {
@@ -540,7 +553,7 @@ class MainActivity : ComponentActivity() {
                         WtCard {
                             WtSwitchRow(
                                 title = tr("Защищённый DNS (DoH)"),
-                                subtitle = tr("Экспериментально. Помогает, если DNS оператора подменяет ответы, но отключает UDP: звонки в Instagram работать не будут. Видео YouTube и ленты идут по TCP и не страдают."),
+                                subtitle = tr("Рекомендуется. Адреса сайтов определяются через защищённый DNS, а если адрес закрыт оператором, пробуется другой. Помогает, когда лента открывается, а комментарии и статусы нет. Отключает UDP: звонки не работают, видео YouTube и ленты идут по TCP и не страдают."),
                                 checked = dohOn,
                                 enabled = !running,
                                 onChange = {

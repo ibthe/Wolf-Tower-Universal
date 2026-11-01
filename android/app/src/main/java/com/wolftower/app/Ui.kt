@@ -82,6 +82,9 @@ object WT {
     val IgBlue = Color(0xFF4F5BD5)
     val IgAction = Color(0xFF0095F6)
 
+    // WhatsApp
+    val WaGreen = Color(0xFF25D366)
+
     val Accent = YtRed
     val AccentGlow = YtRedSoft
     val AccentDeep = Color(0xFF4A1015) // тёмно-красная подложка выбранной плашки
@@ -449,19 +452,43 @@ fun InstagramGlyph(iconSize: Dp = 34.dp) {
     }
 }
 
+/** Значок WhatsApp: зелёная плашка, белый пузырь чата с хвостиком и трубка. */
+@Composable
+fun WhatsAppGlyph(iconSize: Dp = 34.dp) {
+    Canvas(Modifier.size(iconSize)) {
+        val s = this.size.minDimension
+        drawRoundRect(WT.WaGreen, topLeft = Offset.Zero, size = Size(s, s), cornerRadius = CornerRadius(s * 0.28f, s * 0.28f))
+        drawCircle(Color.White, radius = s * 0.29f, center = Offset(s * 0.50f, s * 0.47f), style = Stroke(width = s * 0.07f))
+        val tail = Path().apply {
+            moveTo(s * 0.20f, s * 0.82f)
+            lineTo(s * 0.27f, s * 0.60f)
+            lineTo(s * 0.43f, s * 0.72f)
+            close()
+        }
+        drawPath(tail, Color.White)
+        val phone = Path().apply {
+            moveTo(s * 0.40f, s * 0.36f)
+            quadraticBezierTo(s * 0.36f, s * 0.50f, s * 0.55f, s * 0.60f)
+        }
+        drawPath(phone, Color.White, style = Stroke(width = s * 0.09f, cap = StrokeCap.Round))
+    }
+}
+
 /** Значок сервиса по id из profiles.json. */
 @Composable
 fun ServiceGlyph(id: String, iconSize: Dp = 34.dp) {
     when (id) {
         "youtube" -> YouTubeGlyph(iconSize)
         "instagram" -> InstagramGlyph(iconSize)
+        "whatsapp" -> WhatsAppGlyph(iconSize)
         else -> Box(Modifier.size(iconSize).clip(RoundedCornerShape(8.dp)).background(WT.SurfaceHigh))
     }
 }
 
-/** Цвет переключателя сервиса: красный у YouTube, розовый у Instagram. */
+/** Цвет переключателя сервиса: красный у YouTube, розовый у Instagram, зелёный у WhatsApp. */
 fun serviceAccent(id: String): Color = when (id) {
     "instagram" -> WT.IgPink
+    "whatsapp" -> WT.WaGreen
     else -> WT.YtRed
 }
 

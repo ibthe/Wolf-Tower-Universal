@@ -1,4 +1,4 @@
-const { probeHost } = require('./probe');
+const { measureHost } = require('./probe');
 const { DohSocks } = require('./dohsocks');
 
 async function runWithLimit(tasks, limit) {
@@ -18,10 +18,13 @@ async function runWithLimit(tasks, limit) {
  * Проверка идёт через тот же DNS-переходник, что и рабочий режим: иначе системный DNS отдаёт закрытые провайдером
  * адреса (так у Instagram), и ни одна стратегия не проходит, хотя в рабочем режиме страница бы открылась.
  */
-async function score({ makeProcess, freePort, forName, profiles, candidates, isCancelled, onProgress, batch = 4, makeFront }) {
+async function score({ makeProcess, freePort, forName, profiles, candidates, isCancelled, onProgress, batch = 4, makeFront, stats = {} }) {
   const newFront = makeFront || ((upstreamPort) => new DohSocks({ upstreamPort, staggerMs: 1000 }));
   const counts = {};
-  for (const p of profiles) counts[p.id] = {};
+  for (const p of profiles) {
+    counts[p.id] = {};
+    stats[p.id] = {}; // стратегия -> { ok, latencySum, kbpsSum }: по ним среди рабочих путей выбирается самый быстрый
+  }
 
   for (let i = 0; i < candidates.length; i += batch) {
     if (isCancelled()) break;
@@ -44,8 +47,13 @@ async function score({ makeProcess, freePort, forName, profiles, candidates, isC
         for (const profile of profiles) {
           for (const host of profile.probeHosts) {
             tasks.push(async () => {
-              if (await probeHost(host, port, 5000, { minBytes: profile.probeMinBytes, budgetMs: profile.probeBudgetMs })) {
+              const r = await measureHost(host, port, 5000, { minBytes: profile.probeMinBytes, budgetMs: profile.probeBudgetMs });
+              if (r.ok) {
                 counts[profile.id][strategy] = (counts[profile.id][strategy] || 0) + 1;
+                const st = (stats[profile.id][strategy] = stats[profile.id][strategy] || { ok: 0, latencySum: 0, kbpsSum: 0 });
+                st.ok++;
+                st.latencySum += r.latencyMs;
+                st.kbpsSum += r.kbps;
               }
             });
           }
@@ -56,9 +64,14 @@ async function score({ makeProcess, freePort, forName, profiles, candidates, isC
       await Promise.all(procs.map((p) => Promise.all([p.front.stop().catch(() => {}), p.proc.stop()])));
     }
     onProgress(Math.min(i + batch, candidates.length));
-    // Ранее найденный вариант с полным баллом не проиграет более позднему (при равенстве выигрывает более
-    // ранний), поэтому остальные пачки можно не проверять.
-    if (profiles.every((p) => !p.probeHosts.length || Object.values(counts[p.id]).some((c) => c >= p.probeHosts.length))) break;
+    // Когда у каждого сервиса есть вариант с полным баллом, дальше не ищем: быстрее и меньше трафика. Но сравниваются
+    // минимум две пачки (до 8 вариантов), чтобы из рабочих путей выбрать самый быстрый.
+    if (
+      i + batch >= 2 * batch &&
+      profiles.every((p) => !p.probeHosts.length || Object.values(counts[p.id]).some((c) => c >= p.probeHosts.length))
+    ) {
+      break;
+    }
   }
   return counts;
 }
@@ -77,4 +90,35 @@ function chooseBest(counts, candidates) {
   return { best, ok: bestOk };
 }
 
-module.exports = { score, chooseBest };
+/**
+ * Качество пути: скорость (КБ/с), уменьшенная на задержку. Больше скорость и меньше задержка = лучше;
+ * задержка 500 мс вдвое снижает оценку.
+ */
+function quality(kbps, latencyMs) {
+  return kbps / (1 + latencyMs / 500);
+}
+
+/**
+ * Все варианты хотя бы с одним успехом, лучший первым: по числу успехов, затем по качеству, затем по порядку в списке
+ * стратегий. Возвращает [{ strategy, ok, total, latencyMs, kbps }]. По умолчанию берётся первый, остальные можно
+ * выбрать вручную.
+ */
+function rank(stats, candidates, total) {
+  const out = [];
+  candidates.forEach((strategy, index) => {
+    const st = stats && stats[strategy];
+    if (!st || st.ok <= 0) return;
+    out.push({
+      index,
+      strategy,
+      ok: st.ok,
+      total,
+      latencyMs: Math.round(st.latencySum / st.ok),
+      kbps: Math.round(st.kbpsSum / st.ok),
+    });
+  });
+  out.sort((a, b) => b.ok - a.ok || quality(b.kbps, b.latencyMs) - quality(a.kbps, a.latencyMs) || a.index - b.index);
+  return out.map(({ index, ...rest }) => rest);
+}
+
+module.exports = { score, chooseBest, rank, quality };

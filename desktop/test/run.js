@@ -16,6 +16,7 @@ const { License } = require('../src/license');
 const { probeHost } = require('../src/probe');
 const { chooseBest } = require('../src/autoprobe');
 const { Engine, ByeDpi, freePort } = require('../src/engine');
+const autoprobeMod = require('../src/autoprobe');
 const { DohSocks, parseDohAnswer, resolve4 } = require('../src/dohsocks');
 
 let passed = 0;
@@ -641,6 +642,23 @@ const config = loadConfig([path.join(root, 'profiles', 'profiles.json')]);
     wa.close();
     assert.deepStrictEqual(seenWa, ['127.0.0.1', '127.0.0.1']);
     assert.deepStrictEqual(seenMain, ['127.0.0.2', '127.0.0.2']);
+  });
+
+  await test('автоподбор: среди равных по числу успехов выигрывает более быстрый путь, остальные остаются в списке', async () => {
+    const candidates = ['none', 'a', 'b', 'c', 'd'];
+    const stats = {
+      a: { ok: 4, latencySum: 4 * 900, kbpsSum: 4 * 100 }, // полный балл, но медленный
+      b: { ok: 4, latencySum: 4 * 200, kbpsSum: 4 * 400 }, // полный балл и быстрый: лучший
+      c: { ok: 2, latencySum: 2 * 100, kbpsSum: 2 * 900 }, // быстрый, но открылось меньше адресов
+      d: { ok: 0, latencySum: 0, kbpsSum: 0 }, // не открылся: в список не попадает
+    };
+    const r = autoprobeMod.rank(stats, candidates, 4);
+    assert.deepStrictEqual(r.map((x) => x.strategy), ['b', 'a', 'c']);
+    assert.deepStrictEqual(r[0], { strategy: 'b', ok: 4, total: 4, latencyMs: 200, kbps: 400 });
+    // при полном равенстве скорости выигрывает более ранний в списке
+    const eq = { a: { ok: 3, latencySum: 300, kbpsSum: 300 }, b: { ok: 3, latencySum: 300, kbpsSum: 300 } };
+    assert.deepStrictEqual(autoprobeMod.rank(eq, ['none', 'a', 'b'], 4).map((x) => x.strategy), ['a', 'b']);
+    assert.deepStrictEqual(autoprobeMod.rank({}, candidates, 4), []);
   });
 
   console.log(results.join('\n'));

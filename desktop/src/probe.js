@@ -132,9 +132,10 @@ function readResponse(sock, timeoutMs, minBytes = MIN_BYTES, budgetMs = 0) {
  * дочитан до конца или дошёл минимум до MIN_BYTES. tlsOptions: destPort и tls нужны только тестам; minBytes и budgetMs
  * задают порог по размеру и времени (для сервисов с замедлением, YouTube).
  */
-async function probeHost(host, proxyPort, timeoutMs = 5000, tlsOptions = {}) {
+async function measureHost(host, proxyPort, timeoutMs = 5000, tlsOptions = {}) {
   let raw = null;
   let secure = null;
+  const t0 = Date.now();
   try {
     raw = await socks5Connect(proxyPort, host, tlsOptions.destPort || 443, timeoutMs);
     secure = tls.connect({ socket: raw, servername: host, ...tlsOptions.tls });
@@ -145,13 +146,19 @@ async function probeHost(host, proxyPort, timeoutMs = 5000, tlsOptions = {}) {
       }),
       timeoutMs
     );
+    const latencyMs = Date.now() - t0;
+    let bytes = 0;
+    secure.on('data', (d) => (bytes += d.length));
+    const t1 = Date.now();
     secure.write(
       `GET / HTTP/1.1\r\nHost: ${host}\r\nUser-Agent: Mozilla/5.0\r\nAccept: */*\r\n` +
         'Accept-Encoding: identity\r\nConnection: close\r\n\r\n'
     );
-    return await readResponse(secure, timeoutMs, tlsOptions.minBytes || MIN_BYTES, tlsOptions.budgetMs || 0);
+    const ok = await readResponse(secure, timeoutMs, tlsOptions.minBytes || MIN_BYTES, tlsOptions.budgetMs || 0);
+    const readMs = Math.max(1, Date.now() - t1);
+    return { ok, latencyMs, kbps: ok ? Math.round((bytes * 1000) / readMs / 1024) : 0 };
   } catch (_) {
-    return false;
+    return { ok: false, latencyMs: 0, kbps: 0 };
   } finally {
     try {
       if (secure) secure.destroy();
@@ -166,4 +173,9 @@ async function probeHost(host, proxyPort, timeoutMs = 5000, tlsOptions = {}) {
   }
 }
 
-module.exports = { probeHost, socks5Connect, MIN_BYTES };
+/** То же, что measureHost, но только успех или неудача. */
+async function probeHost(host, proxyPort, timeoutMs = 5000, tlsOptions = {}) {
+  return (await measureHost(host, proxyPort, timeoutMs, tlsOptions)).ok;
+}
+
+module.exports = { probeHost, measureHost, socks5Connect, MIN_BYTES };

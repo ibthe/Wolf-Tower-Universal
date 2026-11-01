@@ -50,6 +50,10 @@ class DpiVpnService : VpnService() {
     @Volatile
     private var byeDpi: ByeDpiProcess? = null
     private var shim: DohSocksShim? = null
+
+    /** Отдельные ByeDPI для сервисов без SNI (WhatsApp) при нескольких включённых сервисах: порт и процесс по id сервиса. */
+    private val extraPorts = HashMap<String, Int>()
+    private val extraProcs = HashMap<String, ByeDpiProcess>()
     private var executor: ScheduledExecutorService? = null
     private var netCallback: ConnectivityManager.NetworkCallback? = null
 
@@ -113,14 +117,30 @@ class DpiVpnService : VpnService() {
         }
         synchronized(lock) { byeDpi = proc }
 
+        val routes = ArrayList<ShimRoute>()
         if (doh) {
-            val s = DohSocksShim(socksPort, byePort, ::appendLog)
+            // Сервис match_all (чат WhatsApp идёт по Noise без SNI) среди нескольких сервисов не ловится фильтром
+            // --hosts, поэтому для него поднимается свой ByeDPI без фильтра, а переходник направляет в него
+            // домены сервиса по имени.
+            extraPorts.clear()
+            for ((p, st) in dedicatedSelection()) {
+                val port = Ports.free()
+                val ep = ByeDpiProcess(this)
+                if (!ep.start(port, StrategyArgs.BASE + noUdpArgs() + StrategyArgs.forName(st), ::appendLog)) {
+                    fail(tr("ByeDPI не запустился"))
+                    return
+                }
+                synchronized(lock) { extraProcs[p.id] = ep }
+                extraPorts[p.id] = port
+                routes.add(ShimRoute(p.name, p.domains.map { it.lowercase() }, port))
+            }
+            val s = DohSocksShim(socksPort, byePort, ::appendLog, routes)
             if (!s.start()) {
                 fail(tr("DoH-прокси не запустился"))
                 return
             }
             shim = s
-            appendLog("DoH включён: UDP и QUIC отключены")
+            appendLog("DoH включён: UDP и QUIC отключены, адреса определяются через DoH")
         }
 
         val config = ProfilesRepository.load(this)
@@ -172,10 +192,33 @@ class DpiVpnService : VpnService() {
         }
         appendLog("Стратегии: " + selection.joinToString { "${it.first.name}=${it.second}" })
 
-        // Запрет UDP (QUIC): по выбору пользователя, а если не задано, то когда его хотят все сервисы
+        val ded = dedicatedSelection(selection)
+        return StrategyArgs.BASE + noUdpArgs() + StrategyArgs.buildGroups(selection.filter { it !in ded })
+    }
+
+    /** Запрет UDP (QUIC): по выбору пользователя, а если не задано, то когда его хотят все сервисы. */
+    private fun noUdpArgs(): List<String> {
+        val config = ProfilesRepository.load(this)
+        val chosen = config.profiles.filter { it.id in Settings.enabledIds(this) }
         val blockQuic = Settings.blockQuicPref(this) ?: chosen.all { it.blockQuic }
-        val noUdp = if (blockQuic) listOf("-U") else emptyList()
-        return StrategyArgs.BASE + noUdp + StrategyArgs.buildGroups(selection)
+        return if (blockQuic) listOf("-U") else emptyList()
+    }
+
+    /**
+     * Сервисы с match_all (WhatsApp), которым нужен отдельный ByeDPI без фильтра по SNI: только когда включено несколько
+     * сервисов и работает DoH-переходник (он знает имя домена до подключения). Один такой сервис работает как раньше.
+     */
+    private fun dedicatedSelection(selection: List<Pair<Profile, String>> = currentSelection()): List<Pair<Profile, String>> {
+        if (!Settings.dohEnabled(this)) return emptyList()
+        val active = selection.filter { it.second != "none" }
+        return if (active.size > 1) active.filter { it.first.matchAll } else emptyList()
+    }
+
+    private fun currentSelection(): List<Pair<Profile, String>> {
+        val config = ProfilesRepository.load(this)
+        return config.profiles.filter { it.id in Settings.enabledIds(this) }.map {
+            it to (sessionOverrides[it.id] ?: Settings.strategyFor(this, it.id, config.defaultStrategy))
+        }
     }
 
     private fun setRunning(value: Boolean) {
@@ -271,24 +314,16 @@ class DpiVpnService : VpnService() {
         val current = sessionOverrides[p.id] ?: Settings.strategyFor(this, p.id, config.defaultStrategy)
         val candidates = ((if (p.matchAll) emptyList() else listOf("none")) + config.strategies).filter { it != current }
         appendLog("Проблема с ${p.name}, подбираю другую стратегию…")
-        val counts = AutoProbe.score(this, listOf(p), candidates, { Thread.currentThread().isInterrupted }) { }
+        val stats = AutoProbe.scoreDetailed(this, listOf(p), candidates, { Thread.currentThread().isInterrupted }) { }
             .getValue(p.id)
-        var best: String? = null
-        var bestOk = 0
-        for (s in candidates) {
-            val c = counts[s] ?: 0
-            if (c > bestOk) {
-                best = s
-                bestOk = c
-            }
-        }
-        if (best == null) {
+        val top = AutoProbe.rank(p, stats, candidates).firstOrNull()
+        if (top == null) {
             appendLog("${p.name}: ничего не помогло (возможна блокировка по IP)")
             return
         }
         // Только на время этого сеанса: кратковременный сбой сети не должен навсегда испортить настройки
-        sessionOverrides[p.id] = best
-        appendLog("${p.name}: временно переключено на $best ($bestOk/${p.probeHosts.size}), в настройках без изменений")
+        sessionOverrides[p.id] = top.strategy
+        appendLog("${p.name}: временно переключено на ${top.strategy} (${top.ok}/${p.probeHosts.size}, ${top.latencyMs} мс), в настройках без изменений")
         restartByeDpi()
     }
 
@@ -303,6 +338,17 @@ class DpiVpnService : VpnService() {
                 return false
             }
             byeDpi = proc
+            // Отдельные ByeDPI на тех же портах (переходник ходит в них по тем же адресам), с актуальными стратегиями
+            for ((p, st) in dedicatedSelection()) {
+                val port = extraPorts[p.id] ?: continue
+                extraProcs[p.id]?.stop()
+                val ep = ByeDpiProcess(this)
+                if (!ep.start(port, StrategyArgs.BASE + noUdpArgs() + StrategyArgs.forName(st), ::appendLog)) {
+                    extraProcs.remove(p.id)
+                    return false
+                }
+                extraProcs[p.id] = ep
+            }
         }
         return true
     }
@@ -359,6 +405,9 @@ class DpiVpnService : VpnService() {
         synchronized(lock) {
             runCatching { byeDpi?.stop() }
             byeDpi = null
+            for (ep in extraProcs.values) runCatching { ep.stop() }
+            extraProcs.clear()
+            extraPorts.clear()
         }
         runCatching { tun?.close() }
         tun = null

@@ -84,6 +84,7 @@ function setupCopyButton(btn, getText) {
 const GLYPH = {
   youtube: '<svg viewBox="0 0 34 34"><rect x="0" y="5" width="34" height="24" rx="7" fill="#ff0000"/><path d="M13.6 12.2v9.6l8.4-4.8z" fill="#fff"/></svg>',
   instagram: '<svg viewBox="0 0 34 34"><defs><linearGradient id="ig" x1="0" y1="1" x2="1" y2="0"><stop offset="0" stop-color="#feda75"/><stop offset=".28" stop-color="#fa7e1e"/><stop offset=".55" stop-color="#d62976"/><stop offset=".78" stop-color="#962fbf"/><stop offset="1" stop-color="#4f5bd5"/></linearGradient></defs><rect width="34" height="34" rx="9.5" fill="url(#ig)"/><rect x="6.8" y="6.8" width="20.4" height="20.4" rx="6" fill="none" stroke="#fff" stroke-width="2.5"/><circle cx="17" cy="17" r="4.8" fill="none" stroke="#fff" stroke-width="2.5"/><circle cx="23.4" cy="10.6" r="1.4" fill="#fff"/></svg>',
+  whatsapp: '<svg viewBox="0 0 34 34"><rect width="34" height="34" rx="9.5" fill="#25d366"/><circle cx="17" cy="16" r="9.8" fill="none" stroke="#fff" stroke-width="2.4"/><path d="M6.8 27.8l2.3-7.4 5.4 4.2z" fill="#fff"/><path d="M13.6 12.2q-1.4 5 4.8 8.2" fill="none" stroke="#fff" stroke-width="3" stroke-linecap="round"/></svg>',
 };
 
 let advId = null;
@@ -138,11 +139,22 @@ function renderChips(profile) {
   const box = $('chips');
   box.textContent = '';
   const cur = S.chosen[profile.id];
-  for (const s of ['none', ...S.strategies]) {
+  // Найденные автоподбором пути идут первыми (лучший по числу открытых адресов, скорости и задержке первым, со ★)
+  // и подписаны замерами; остальные стратегии ниже. Выбрать можно любой.
+  const all = ['none', ...S.strategies];
+  const ranking = ((S.ranking || {})[profile.id] || []).filter((r) => all.includes(r.strategy));
+  const rankOf = Object.fromEntries(ranking.map((r) => [r.strategy, r]));
+  const ordered = [...ranking.map((r) => r.strategy), ...all.filter((s) => !rankOf[s])];
+  $('chipsHint').hidden = !ranking.length;
+  for (const s of ordered) {
+    const r = rankOf[s];
     const b = document.createElement('button');
     b.className = 'chip' + (s === cur ? ' on' : '');
     b.disabled = S.running;
-    b.textContent = strategyLabel(s);
+    b.textContent =
+      (r && s === ordered[0] ? '★ ' : '') +
+      strategyLabel(s) +
+      (r ? trf(' · {0}/{1} · {2} мс · {3} КБ/с', r.ok, r.total, r.latencyMs, r.kbps) : '');
     b.addEventListener('click', () => window.wt.setStrategy(profile.id, s));
     box.append(b);
   }
