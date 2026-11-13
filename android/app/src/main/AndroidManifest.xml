@@ -8,7 +8,7 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
 
-    <!-- чтобы видеть, какие из приложений YouTube и Instagram установлены (пакеты из profiles.json) -->
+    <!-- чтобы видеть, какие из приложений YouTube, Instagram и WhatsApp установлены (пакеты из profiles.json) -->
     <queries>
         <package android:name="com.google.android.youtube" />
         <package android:name="com.google.android.apps.youtube.music" />
@@ -18,6 +18,8 @@
         <package android:name="app.revanced.android.apps.youtube.music" />
         <package android:name="com.instagram.android" />
         <package android:name="com.instagram.lite" />
+        <package android:name="com.whatsapp" />
+        <package android:name="com.whatsapp.w4b" />
     </queries>
 
     <application

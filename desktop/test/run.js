@@ -38,7 +38,7 @@ const config = loadConfig([path.join(root, 'profiles', 'profiles.json')]);
 
 (async () => {
   await test('профили и стратегии загружаются, по умолчанию split+disorder', () => {
-    assert.deepStrictEqual(config.profiles.map((p) => p.id), ['youtube', 'instagram']);
+    assert.deepStrictEqual(config.profiles.map((p) => p.id), ['youtube', 'instagram', 'whatsapp']);
     assert.strictEqual(config.defaultStrategy, 'split+disorder');
     assert.deepStrictEqual(forName('split+disorder'), ['-s1+s', '-d3+s']);
     assert.deepStrictEqual(forName('fake+oob'), ['-f-1', '-t', '8', '-o1+s']);
@@ -79,11 +79,11 @@ const config = loadConfig([path.join(root, 'profiles', 'profiles.json')]);
       /не удалось запустить ByeDPI: не найден файл ciadpi/);
   });
 
-  await test('включённые сервисы: по умолчанию оба, затем выбор пользователя', () => {
+  await test('включённые сервисы: по умолчанию все, затем выбор пользователя', () => {
     const st = new Store(path.join(tmp, 'en'));
-    assert.deepStrictEqual(enabledIds(config, st), ['youtube', 'instagram']);
+    assert.deepStrictEqual(enabledIds(config, st), ['youtube', 'instagram', 'whatsapp']);
     st.set('enabled', ['instagram', 'whatsapp']);
-    assert.deepStrictEqual(enabledIds(config, st), ['instagram']);
+    assert.deepStrictEqual(enabledIds(config, st), ['instagram', 'whatsapp']);
     st.set('enabled', []);
     assert.deepStrictEqual(enabledIds(config, st), []);
   });

@@ -1,0 +1,24 @@
+Убраны из profiles.json: для них нет аргументов в StrategyArgs.kt / desktop/src/profiles.js (запускались как "без обхода").
+Вернуть можно, когда будут добавлены определения из дерева Wolf-Tower-WApp.
+
+abs+udp
+abs-sni+udp
+chain-d+udp
+chain-r+udp
+light+udp
+abs-fake8+udp
+abs-split+udp
+drip+udp
+abs-disorder+udp
+abs-oob+udp
+abs-disoob+udp
+abs-fake5+udp
+abs-udp3
+chain+udp2
+tlsrec+udp
+tlsrec-abs+udp
+tlsrec-s50+udp
+oob-r+udp
+oob2+udp
+fake8+udp
+mix+udp3
